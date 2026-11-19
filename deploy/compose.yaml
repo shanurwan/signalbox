@@ -1,0 +1,40 @@
+# Local stack: signalbox + ClickHouse for storage + VictoriaMetrics scraping
+# signalbox's request metrics. Start with: docker compose -f deploy/compose.yaml up
+services:
+  signalbox:
+    build: ..
+    environment:
+      SIGNALBOX_INGEST_TOKEN: dev-ingest
+      SIGNALBOX_API_TOKEN: dev-api
+      SIGNALBOX_STATE_FILE: /data/state.json
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: signalbox
+      CLICKHOUSE_PASSWORD: signalbox
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+    ports: ["8080:8080", "4317:4317"]
+    volumes: ["signalbox-data:/data"]
+    user: "0"   # writes /data on a fresh named volume; drop if your volume is owned by 65532
+    depends_on: [clickhouse]
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_USER: signalbox
+      CLICKHOUSE_PASSWORD: signalbox
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ulimits: { nofile: { soft: 262144, hard: 262144 } }
+    volumes: ["clickhouse-data:/var/lib/clickhouse"]
+
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.129.1
+    command:
+      - -promscrape.config=/etc/vm/scrape.yaml
+      - -retentionPeriod=90d
+    volumes: ["./scrape.yaml:/etc/vm/scrape.yaml:ro", "vm-data:/victoria-metrics-data"]
+    ports: ["8428:8428"]
+
+volumes:
+  signalbox-data:
+  clickhouse-data:
+  vm-data:

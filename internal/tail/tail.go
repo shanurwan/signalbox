@@ -11,6 +11,7 @@ import (
 )
 
 type Filter struct {
+	Tenant      string // "" for every tenant (admin only)
 	Service     string
 	Environment string
 	MinSeverity model.Severity
@@ -19,6 +20,9 @@ type Filter struct {
 }
 
 func (f *Filter) match(r *model.Record) bool {
+	if f.Tenant != "" && r.Tenant != f.Tenant {
+		return false
+	}
 	if f.Service != "" && r.Service != f.Service {
 		return false
 	}

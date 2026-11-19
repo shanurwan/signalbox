@@ -64,8 +64,16 @@ type HTTP struct {
 	RequestID  string
 }
 
+// DefaultTenant owns everything when signalbox runs for one team, and the
+// records sent with the ingest token from the config file.
+const DefaultTenant = "default"
+
 // Record is one log line, or one request log, after ingestion.
 type Record struct {
+	// Tenant is set from the ingest token that delivered the record, never
+	// from the record's contents, so a sender cannot write into another
+	// tenant's alerts by setting an attribute.
+	Tenant      string
 	Time        time.Time
 	Service     string
 	Environment string

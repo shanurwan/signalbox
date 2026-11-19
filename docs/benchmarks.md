@@ -15,6 +15,21 @@ Three rules (error-log count, 5xx ratio, p99 latency), 20 services, 1,000-record
 | one service per batch (as OTLP exports group by resource) | 12.3 M records/s | 24.4 M | 33.2 M |
 | every record a different group (worst case) | 1.6 M | 2.1 M | 2.0 M |
 
+### With tenants
+
+Tenants added a tenant lookup per batch and the tenant in every series key. On 20 November the previous build and the tenant build ran back to back on the same machine, ten runs each. `ObserveTenant` is the path the pipeline takes, since a batch always comes from one token.
+
+| Batch shape | before tenants (median) | with tenants (median) |
+|---|---|---|
+| one service per batch, 1 core | 12.9 M records/s | 12.5 M |
+| one service per batch, 12 cores | 32.6 M | 31.7 M |
+| every record a different group, 1 core | 1.5 M | 1.6 M |
+| every record a different group, 12 cores | 1.8 M | 1.8 M |
+
+The first tenant build was about 8% slower on one core. A profile showed 10% of CPU in a loop that split each batch into runs of the same tenant, touching every record once more to find what the pipeline already knew. `ObserveTenant` skips it.
+
+End to end, alerting only, with four rules (16 connections, 1,000 records per export, 20 s): the previous build did 400,050 and 391,482 records/s, and the tenant build 402,676 and 370,619. The runs vary as much as the builds.
+
 ## End to end over OTLP/gRPC
 
 `cmd/sbload` sends synthetic request logs: 20 services, about 5% 404s, 1% 5xx, exponential latency with a 40 ms mean, and a unique request ID per record (so dedupe does real work). Each export carries 1,000 records.

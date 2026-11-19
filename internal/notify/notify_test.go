@@ -40,7 +40,7 @@ func TestRetriesInOrderUntilDelivered(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	o := New([]config.Receiver{{Name: "hook", Type: "webhook", URL: srv.URL}}, quiet())
+	o := New([]config.Receiver{{Name: "hook", Type: "webhook", URL: srv.URL}}, false, quiet())
 	o.Enqueue(ev("firing"))
 	o.Enqueue(ev("resolved"))
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -62,7 +62,7 @@ func TestRetriesInOrderUntilDelivered(t *testing.T) {
 func TestClientErrorIsNotRetried(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) }))
 	defer srv.Close()
-	o := New([]config.Receiver{{Name: "hook", Type: "webhook", URL: srv.URL}}, quiet())
+	o := New([]config.Receiver{{Name: "hook", Type: "webhook", URL: srv.URL}}, false, quiet())
 	o.Enqueue(ev("firing"))
 	o.deliverDue(context.Background())
 	if o.Pending() != 0 || o.Stats()["hook"].Dropped != 1 {
@@ -89,7 +89,7 @@ func TestPagerDutyTriggerResolvePairing(t *testing.T) {
 	if m["event_action"] != "resolve" || m["dedup_key"] != "f00d" {
 		t.Fatalf("%s", b)
 	}
-	o := New([]config.Receiver{r}, quiet())
+	o := New([]config.Receiver{r}, false, quiet())
 	e := ev("reminder")
 	e.Receivers = []string{"pd"}
 	o.Enqueue(e)
@@ -113,10 +113,10 @@ func TestNoDataEventStillEncodes(t *testing.T) {
 
 func TestOutboxSurvivesRestart(t *testing.T) {
 	recv := []config.Receiver{{Name: "hook", Type: "webhook", URL: "http://127.0.0.1:1"}}
-	o := New(recv, quiet())
+	o := New(recv, false, quiet())
 	o.Enqueue(ev("firing"))
 	saved := o.Snapshot()
-	o2 := New(recv, quiet())
+	o2 := New(recv, false, quiet())
 	o2.Restore(saved)
 	if o2.Pending() != 1 || o2.Snapshot()[0].Event.Status != "firing" {
 		t.Fatal("pending notification lost across restart")

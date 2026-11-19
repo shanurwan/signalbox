@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +23,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	collogs "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	_ "google.golang.org/grpc/encoding/gzip" // accept gzip-compressed exports
@@ -31,6 +31,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/shanurwan/signalbox/internal/config"
 	"github.com/shanurwan/signalbox/internal/engine"
@@ -53,6 +54,7 @@ type Server struct {
 	Hub     *tail.Hub
 	Pipe    *Pipeline
 	reg     *prometheus.Registry
+	tenants *registry
 	started time.Time
 	dirty   chan struct{} // a transition or delivery happened: save soon
 }
@@ -60,7 +62,13 @@ type Server struct {
 func New(cfg *config.Config, log *slog.Logger) *Server {
 	s := &Server{cfg: cfg, log: log, conv: ingest.NewConverter(cfg.Mapping), Hub: tail.NewHub(), started: time.Now(),
 		dirty: make(chan struct{}, 1)}
-	s.Outbox = notify.New(cfg.Receivers, log)
+	s.tenants = newRegistry()
+	def := newTenant(model.DefaultTenant, config.TenantLimits{}, s.started)
+	if cfg.IngestToken != "" {
+		def.ingestHash = hashToken(cfg.IngestToken)
+	}
+	s.tenants.put(def)
+	s.Outbox = notify.New(cfg.Receivers, cfg.TenantReceiversAllowPrivate, log)
 	s.Outbox.Changed = s.markDirty
 	s.Engine = engine.New(cfg.Rules, cfg.MaxLateness, func(ev engine.Event) {
 		log.Info("alert", "rule", ev.Rule, "status", ev.Status, "labels", ev.Labels, "value", ev.Value)
@@ -92,6 +100,7 @@ func (s *Server) markDirty() {
 type checkpoint struct {
 	Version int                  `json:"version"`
 	SavedAt time.Time            `json:"saved_at"`
+	Tenants []savedTenant        `json:"tenants,omitempty"`
 	Series  []engine.SavedSeries `json:"series"`
 	Outbox  []notify.Item        `json:"outbox"`
 }
@@ -111,9 +120,12 @@ func (s *Server) LoadState() error {
 	if err := json.Unmarshal(b, &cp); err != nil {
 		return fmt.Errorf("state file %s: %w", s.cfg.StateFile, err)
 	}
+	// Tenants first: series and queued notifications refer to their rules
+	// and receivers.
+	s.restoreTenants(cp.Tenants)
 	n := s.Engine.Restore(cp.Series)
 	s.Outbox.Restore(cp.Outbox)
-	s.log.Info("state restored", "series", n, "outbox", len(cp.Outbox), "saved_at", cp.SavedAt)
+	s.log.Info("state restored", "tenants", len(cp.Tenants), "series", n, "outbox", len(cp.Outbox), "saved_at", cp.SavedAt)
 	return nil
 }
 
@@ -122,7 +134,8 @@ func (s *Server) SaveState() error {
 	if s.cfg.StateFile == "" {
 		return nil
 	}
-	b, err := json.Marshal(checkpoint{Version: 1, SavedAt: time.Now(), Series: s.Engine.Snapshot(), Outbox: s.Outbox.Snapshot()})
+	b, err := json.Marshal(checkpoint{Version: 2, SavedAt: time.Now(), Tenants: s.snapshotTenants(),
+		Series: s.Engine.Snapshot(), Outbox: s.Outbox.Snapshot()})
 	if err != nil {
 		return err
 	}
@@ -233,13 +246,27 @@ func (s *Server) Run(ctx context.Context) error {
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/logs", s.auth(s.cfg.IngestToken, s.handleOTLP))
-	mux.HandleFunc("POST /ingest", s.auth(s.cfg.IngestToken, s.handleNDJSON))
-	mux.HandleFunc("GET /tail", s.auth(s.cfg.APIToken, s.handleTail))
-	mux.HandleFunc("GET /api/alerts", s.auth(s.cfg.APIToken, s.handleAlerts))
-	mux.HandleFunc("GET /api/rules", s.auth(s.cfg.APIToken, s.handleRules))
-	mux.HandleFunc("POST /api/test-notify", s.auth(s.cfg.APIToken, s.handleTestNotify))
-	mux.Handle("GET /metrics", s.auth(s.cfg.APIToken, promhttp.HandlerFor(s.reg, promhttp.HandlerOpts{}).ServeHTTP))
+	// Ingest: the token picks the tenant.
+	mux.HandleFunc("POST /v1/logs", s.ingest(s.handleOTLP))
+	mux.HandleFunc("POST /ingest", s.ingest(s.handleNDJSON))
+	// Reads and settings: a tenant's API token sees only that tenant.
+	mux.HandleFunc("GET /tail", s.api(s.handleTail))
+	mux.HandleFunc("GET /api/alerts", s.api(s.handleAlerts))
+	mux.HandleFunc("GET /api/rules", s.api(s.handleRules))
+	mux.HandleFunc("PUT /api/rules/{name}", s.api(s.handlePutRule))
+	mux.HandleFunc("DELETE /api/rules/{name}", s.api(s.handleDeleteRule))
+	mux.HandleFunc("GET /api/receivers", s.api(s.handleReceivers))
+	mux.HandleFunc("PUT /api/receivers/{name}", s.api(s.handlePutReceiver))
+	mux.HandleFunc("DELETE /api/receivers/{name}", s.api(s.handleDeleteReceiver))
+	mux.HandleFunc("POST /api/test-notify", s.api(s.handleTestNotify))
+	mux.HandleFunc("GET /api/usage", s.api(s.handleUsage))
+	mux.HandleFunc("GET /api/requests", s.api(s.handleQueryRequests))
+	mux.HandleFunc("GET /api/logs", s.api(s.handleQueryLogs))
+	// Operator only: the api_token from the config file.
+	mux.HandleFunc("GET /api/tenants", s.adminOnly(s.handleListTenants))
+	mux.HandleFunc("PUT /api/tenants/{id}", s.adminOnly(s.handlePutTenant))
+	mux.HandleFunc("DELETE /api/tenants/{id}", s.adminOnly(s.handleDeleteTenant))
+	mux.Handle("GET /metrics", s.adminOnly(promhttp.HandlerFor(s.reg, promhttp.HandlerOpts{}).ServeHTTP))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "ok\n") })
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
 		io.WriteString(w, "signalbox: POST /v1/logs (OTLP), POST /ingest (NDJSON), GET /tail, GET /api/alerts, GET /metrics\n")
@@ -247,22 +274,28 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-func (s *Server) auth(token string, h http.HandlerFunc) http.HandlerFunc {
-	if token == "" {
-		return h
-	}
-	want := []byte("Bearer " + token)
+// ingest authenticates a sender and hands its tenant to the handler.
+func (s *Server) ingest(h func(http.ResponseWriter, *http.Request, *tenant)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		got := r.Header.Get("Authorization")
-		if got == "" && r.URL.Query().Get("token") != "" {
-			got = "Bearer " + r.URL.Query().Get("token")
-		}
-		if subtle.ConstantTimeCompare([]byte(got), want) != 1 {
+		t := s.ingestTenant(bearer(r))
+		if t == nil {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		h(w, r)
+		h(w, r, t)
 	}
+}
+
+// admit applies the tenant's rate limit. Over it, the sender gets 429 with
+// Retry-After, which OTLP exporters and log forwarders treat as "retry
+// later": back-pressure rather than silent loss.
+func (s *Server) admit(w http.ResponseWriter, t *tenant, n int) bool {
+	if t.allow(n, time.Now()) {
+		return true
+	}
+	w.Header().Set("Retry-After", "1")
+	http.Error(w, "rate limit for this tenant exceeded, retry later", http.StatusTooManyRequests)
+	return false
 }
 
 func body(r *http.Request) (io.Reader, error) {
@@ -277,7 +310,7 @@ func body(r *http.Request) (io.Reader, error) {
 	return io.LimitReader(rd, maxBody+1), nil
 }
 
-func (s *Server) handleOTLP(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleOTLP(w http.ResponseWriter, r *http.Request, t *tenant) {
 	rd, err := body(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -303,7 +336,11 @@ func (s *Server) handleOTLP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad OTLP payload: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.Pipe.Submit(s.conv.FromOTLP(req, time.Now()))
+	recs := s.conv.FromOTLP(req, time.Now())
+	if !s.admit(w, t, len(recs)) {
+		return
+	}
+	s.Pipe.Submit(t.ID, recs)
 	resp := &collogs.ExportLogsServiceResponse{}
 	if isJSON {
 		w.Header().Set("Content-Type", "application/json")
@@ -317,7 +354,7 @@ func (s *Server) handleOTLP(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleNDJSON accepts one JSON object per line, or one JSON array.
-func (s *Server) handleNDJSON(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleNDJSON(w http.ResponseWriter, r *http.Request, t *tenant) {
 	rd, err := body(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -352,19 +389,22 @@ func (s *Server) handleNDJSON(w http.ResponseWriter, r *http.Request) {
 			recs = append(recs, s.conv.FromJSON(o, now))
 		}
 	}
-	s.Pipe.Submit(recs)
+	if !s.admit(w, t, len(recs)) {
+		return
+	}
+	s.Pipe.Submit(t.ID, recs)
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, "{\"accepted\":%d}\n", len(recs))
 }
 
-func (s *Server) handleTail(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleTail(w http.ResponseWriter, r *http.Request, c caller) {
 	fl, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
 	q := r.URL.Query()
-	f := tail.Filter{Service: q.Get("service"), Environment: q.Get("environment"), HTTPOnly: q.Get("http") == "1"}
+	f := tail.Filter{Tenant: c.scope(r), Service: q.Get("service"), Environment: q.Get("environment"), HTTPOnly: q.Get("http") == "1"}
 	if lv := q.Get("level"); lv != "" {
 		f.MinSeverity = model.Severity(config.SeverityNumber(lv))
 	}
@@ -450,44 +490,27 @@ func writeJSON(w http.ResponseWriter, v any) {
 	enc.Encode(v)
 }
 
-func (s *Server) handleAlerts(w http.ResponseWriter, _ *http.Request) {
-	alerts := s.Engine.Alerts()
+func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request, c caller) {
+	alerts := s.Engine.Alerts(c.scope(r))
 	if alerts == nil {
 		alerts = []engine.Alert{}
 	}
-	writeJSON(w, map[string]any{"alerts": alerts, "notifications_pending": s.Outbox.Pending()})
+	out := map[string]any{"alerts": alerts}
+	if c.admin {
+		out["notifications_pending"] = s.Outbox.Pending()
+	}
+	writeJSON(w, out)
 }
 
-func (s *Server) handleRules(w http.ResponseWriter, _ *http.Request) {
-	type view struct {
-		Name     string   `json:"name"`
-		When     string   `json:"when"`
-		Window   string   `json:"window"`
-		For      string   `json:"for"`
-		GroupBy  []string `json:"group_by"`
-		Severity string   `json:"severity"`
-		Notify   []string `json:"notify"`
-	}
-	out := []view{}
-	for _, r := range s.cfg.Rules {
-		out = append(out, view{r.Name, r.When, r.Window.String(), r.For.String(), r.GroupBy, r.Severity, r.Notify})
-	}
-	writeJSON(w, map[string]any{"rules": out})
-}
-
-func (s *Server) handleTestNotify(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleTestNotify(w http.ResponseWriter, r *http.Request, c caller) {
 	name := r.URL.Query().Get("receiver")
-	found := false
-	for _, rc := range s.cfg.Receivers {
-		found = found || rc.Name == name
-	}
-	if !found {
+	if !s.Outbox.Has(c.t.ID, name) {
 		http.Error(w, "unknown receiver", http.StatusNotFound)
 		return
 	}
 	now := time.Now()
 	s.Outbox.Enqueue(engine.Event{
-		Rule: "signalbox-test", Status: "firing", Severity: "info",
+		Tenant: c.t.ID, Rule: "signalbox-test", Status: "firing", Severity: "info",
 		Summary: "Test notification from signalbox. If you can read this, the receiver works.",
 		Labels:  map[string]string{"receiver": name}, Metric: "count", Op: ">", Threshold: 0, Value: 1,
 		Window: "1m0s", StartsAt: now, Fingerprint: fmt.Sprintf("test-%d", now.UnixNano()), Receivers: []string{name},
@@ -503,17 +526,27 @@ type grpcLogs struct {
 }
 
 func (g *grpcLogs) Export(ctx context.Context, req *collogs.ExportLogsServiceRequest) (*collogs.ExportLogsServiceResponse, error) {
-	if tok := g.s.cfg.IngestToken; tok != "" {
-		md, _ := metadata.FromIncomingContext(ctx)
-		got := ""
-		if v := md.Get("authorization"); len(v) > 0 {
-			got = v[0]
-		}
-		if subtle.ConstantTimeCompare([]byte(got), []byte("Bearer "+tok)) != 1 {
-			return nil, status.Error(codes.Unauthenticated, "bad or missing bearer token")
+	md, _ := metadata.FromIncomingContext(ctx)
+	tok := ""
+	if v := md.Get("authorization"); len(v) > 0 {
+		var ok bool
+		if tok, ok = strings.CutPrefix(v[0], "Bearer "); !ok {
+			tok = "\x00invalid"
 		}
 	}
-	g.s.Pipe.Submit(g.s.conv.FromOTLP(req, time.Now()))
+	t := g.s.ingestTenant(tok)
+	if t == nil {
+		return nil, status.Error(codes.Unauthenticated, "bad or missing bearer token")
+	}
+	recs := g.s.conv.FromOTLP(req, time.Now())
+	if !t.allow(len(recs), time.Now()) {
+		// With RetryInfo, OTLP exporters retry after the delay instead of
+		// dropping the batch.
+		st, _ := status.New(codes.ResourceExhausted, "rate limit for this tenant exceeded").
+			WithDetails(&errdetails.RetryInfo{RetryDelay: durationpb.New(time.Second)})
+		return nil, st.Err()
+	}
+	g.s.Pipe.Submit(t.ID, recs)
 	return &collogs.ExportLogsServiceResponse{}, nil
 }
 
@@ -532,10 +565,13 @@ var (
 	dStored  = prometheus.NewDesc("signalbox_storage_rows_total", "Rows sent to storage, by result.", []string{"result"}, nil)
 	dQueue   = prometheus.NewDesc("signalbox_storage_queue_rows", "Rows waiting to be written to storage.", nil, nil)
 	dFlush   = prometheus.NewDesc("signalbox_storage_last_flush_seconds", "Duration of the last successful storage write.", nil, nil)
+	dTenants = prometheus.NewDesc("signalbox_tenants", "Tenants, the default one included.", nil, nil)
+	dReject  = prometheus.NewDesc("signalbox_tenant_rejected_records_total", "Records refused by a tenant's rate limit (tenants with any).", []string{"tenant"}, nil)
+	dLimited = prometheus.NewDesc("signalbox_tenant_series_limited_total", "Records not evaluated because the tenant's series limit was reached (tenants with any).", []string{"tenant"}, nil)
 )
 
 func (c *selfCollector) Describe(ch chan<- *prometheus.Desc) {
-	for _, d := range []*prometheus.Desc{dRecords, dDup, dLate, dSeries, dNotify, dOutbox, dTail, dStored, dQueue, dFlush} {
+	for _, d := range []*prometheus.Desc{dRecords, dDup, dLate, dSeries, dNotify, dOutbox, dTail, dStored, dQueue, dFlush, dTenants, dReject, dLimited} {
 		ch <- d
 	}
 }
@@ -549,10 +585,31 @@ func (c *selfCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(dSeries, prometheus.GaugeValue, float64(total-pending-firing), "inactive")
 	ch <- prometheus.MustNewConstMetric(dSeries, prometheus.GaugeValue, float64(pending), "pending")
 	ch <- prometheus.MustNewConstMetric(dSeries, prometheus.GaugeValue, float64(firing), "firing")
+	// Tenants' receivers are summed into one label value: one series per
+	// tenant receiver would grow without bound.
+	stats := map[string]notify.Stats{}
 	for name, st := range s.Outbox.Stats() {
+		if strings.Contains(name, "/") {
+			name = "_tenants"
+		}
+		a := stats[name]
+		a.Sent, a.Failed, a.Dropped = a.Sent+st.Sent, a.Failed+st.Failed, a.Dropped+st.Dropped
+		stats[name] = a
+	}
+	for name, st := range stats {
 		ch <- prometheus.MustNewConstMetric(dNotify, prometheus.CounterValue, float64(st.Sent), name, "sent")
 		ch <- prometheus.MustNewConstMetric(dNotify, prometheus.CounterValue, float64(st.Failed), name, "retry")
 		ch <- prometheus.MustNewConstMetric(dNotify, prometheus.CounterValue, float64(st.Dropped), name, "dropped")
+	}
+	all := s.tenants.all()
+	ch <- prometheus.MustNewConstMetric(dTenants, prometheus.GaugeValue, float64(len(all)))
+	for _, t := range all {
+		if n := t.rejected.Load(); n > 0 {
+			ch <- prometheus.MustNewConstMetric(dReject, prometheus.CounterValue, float64(n), t.ID)
+		}
+		if n := s.Engine.Usage(t.ID).SeriesLimited; n > 0 {
+			ch <- prometheus.MustNewConstMetric(dLimited, prometheus.CounterValue, float64(n), t.ID)
+		}
 	}
 	ch <- prometheus.MustNewConstMetric(dOutbox, prometheus.GaugeValue, float64(s.Outbox.Pending()))
 	ch <- prometheus.MustNewConstMetric(dTail, prometheus.GaugeValue, float64(s.Hub.Subscribers()))

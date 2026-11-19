@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/shanurwan/signalbox/internal/config"
 	"github.com/shanurwan/signalbox/internal/engine"
+	"github.com/shanurwan/signalbox/internal/model"
 )
 
 const (
@@ -42,46 +44,123 @@ type Stats struct {
 	Sent, Failed, Dropped uint64
 }
 
+// Key names a receiver in the outbox. The default tenant's receivers (the
+// ones in the config file) keep their plain names; a tenant's own are
+// tenant/name, so two tenants can both have a receiver called "slack".
+func Key(tenant, name string) string {
+	if tenant == "" || tenant == model.DefaultTenant {
+		return name
+	}
+	return tenant + "/" + name
+}
+
+type receiver struct {
+	config.Receiver
+	restricted bool // created by a tenant: only public addresses
+}
+
+// maxConcurrent caps deliveries in flight, so many tenants with slow or dead
+// receivers cannot use up connections or goroutines.
+const maxConcurrent = 64
+
 type Outbox struct {
-	mu        sync.Mutex
-	items     []*Item
-	nextID    uint64
-	receivers map[string]config.Receiver
-	client    *http.Client
-	log       *slog.Logger
-	wake      chan struct{}
-	stats     map[string]*Stats
+	mu         sync.Mutex
+	items      []*Item
+	nextID     uint64
+	receivers  map[string]receiver
+	client     *http.Client
+	restricted *http.Client
+	log        *slog.Logger
+	wake       chan struct{}
+	stats      map[string]*Stats
 
 	// Changed, when set, is called after deliveries change the outbox, so
 	// the owner can persist it before a crash can resend what was sent.
 	Changed func()
 }
 
-func New(receivers []config.Receiver, log *slog.Logger) *Outbox {
+// New creates an outbox with the config file's receivers. allowPrivate lets
+// receivers created by tenants reach private addresses (for development).
+func New(receivers []config.Receiver, allowPrivate bool, log *slog.Logger) *Outbox {
 	o := &Outbox{
-		receivers: map[string]config.Receiver{},
-		client:    &http.Client{Timeout: 10 * time.Second},
-		log:       log,
-		wake:      make(chan struct{}, 1),
-		stats:     map[string]*Stats{},
+		receivers:  map[string]receiver{},
+		client:     &http.Client{Timeout: 10 * time.Second},
+		restricted: publicOnlyClient(allowPrivate),
+		log:        log,
+		wake:       make(chan struct{}, 1),
+		stats:      map[string]*Stats{},
 	}
 	for _, r := range receivers {
-		o.receivers[r.Name] = r
+		o.receivers[r.Name] = receiver{Receiver: r}
 		o.stats[r.Name] = &Stats{}
 	}
 	return o
 }
 
-// Enqueue adds one item per receiver of the event.
+// SetReceiver adds or replaces a tenant's receiver.
+func (o *Outbox) SetReceiver(tenant string, r config.Receiver) {
+	k := Key(tenant, r.Name)
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.receivers[k] = receiver{Receiver: r, restricted: true}
+	if o.stats[k] == nil {
+		o.stats[k] = &Stats{}
+	}
+}
+
+// RemoveReceiver deletes a tenant's receiver and what was waiting for it.
+func (o *Outbox) RemoveReceiver(tenant, name string) {
+	k := Key(tenant, name)
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	delete(o.receivers, k)
+	delete(o.stats, k)
+	kept := o.items[:0]
+	for _, it := range o.items {
+		if it.Receiver != k {
+			kept = append(kept, it)
+		}
+	}
+	o.items = kept
+}
+
+// Receivers returns a tenant's own receivers, sorted by name.
+func (o *Outbox) Receivers(tenant string) []config.Receiver {
+	prefix := Key(tenant, "")
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	var out []config.Receiver
+	for k, r := range o.receivers {
+		if r.restricted && strings.HasPrefix(k, prefix) && k[len(prefix):] == r.Name {
+			out = append(out, r.Receiver)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// Has reports whether the tenant can send to a receiver of that name.
+func (o *Outbox) Has(tenant, name string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	_, ok := o.receivers[Key(tenant, name)]
+	return ok
+}
+
+// Enqueue adds one item per receiver of the event, looked up among the
+// event's tenant's receivers. Names the tenant has no receiver for are
+// skipped: the alert still shows in the API.
 func (o *Outbox) Enqueue(ev engine.Event) {
 	now := time.Now()
 	o.mu.Lock()
 	for _, name := range ev.Receivers {
-		if o.receivers[name].Type == "pagerduty" && ev.Status == "reminder" {
-			continue // the incident is already open there
+		k := Key(ev.Tenant, name)
+		r, ok := o.receivers[k]
+		if !ok || (r.Type == "pagerduty" && ev.Status == "reminder") {
+			continue // no such receiver, or the incident is already open there
 		}
 		o.nextID++
-		o.items = append(o.items, &Item{ID: o.nextID, Receiver: name, Event: ev, NextAt: now, Created: now})
+		o.items = append(o.items, &Item{ID: o.nextID, Receiver: k, Event: ev, NextAt: now, Created: now})
 	}
 	o.mu.Unlock()
 	select {
@@ -161,17 +240,23 @@ func (o *Outbox) deliverDue(ctx context.Context) {
 	o.mu.Unlock()
 
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxConcurrent)
 	for _, it := range heads {
 		if it.NextAt.After(now) {
 			continue
 		}
 		wg.Add(1)
+		sem <- struct{}{}
 		go func(it *Item) {
 			defer wg.Done()
+			defer func() { <-sem }()
 			err, retry := o.send(ctx, it)
 			o.mu.Lock()
 			defer o.mu.Unlock()
 			st := o.stats[it.Receiver]
+			if st == nil { // the receiver was deleted while sending
+				st = &Stats{}
+			}
 			switch {
 			case err == nil:
 				st.Sent++
@@ -206,8 +291,17 @@ func (o *Outbox) remove(id uint64) {
 
 // send returns whether a failure is worth retrying.
 func (o *Outbox) send(ctx context.Context, it *Item) (error, bool) {
-	r := o.receivers[it.Receiver]
-	url, body, err := Render(r, it.Event)
+	o.mu.Lock()
+	r, ok := o.receivers[it.Receiver]
+	o.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("receiver %q no longer exists", it.Receiver), false
+	}
+	client := o.client
+	if r.restricted {
+		client = o.restricted
+	}
+	url, body, err := Render(r.Receiver, it.Event)
 	if err != nil {
 		return err, false
 	}
@@ -222,9 +316,9 @@ func (o *Outbox) send(ctx context.Context, it *Item) (error, bool) {
 	for k, v := range r.Headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := o.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return err, true
+		return err, !errors.Is(err, errNotPublic) // a blocked address stays blocked
 	}
 	defer resp.Body.Close()
 	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))

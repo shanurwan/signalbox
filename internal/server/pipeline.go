@@ -30,12 +30,17 @@ type Pipeline struct {
 	Duplicates atomic.Uint64
 }
 
-func (p *Pipeline) Submit(recs []model.Record) {
+// Submit runs one tenant's batch through the pipeline. The tenant comes
+// from the token that delivered the batch and overrides anything in it.
+func (p *Pipeline) Submit(tenant string, recs []model.Record) {
 	now := time.Now()
+	for i := range recs {
+		recs[i].Tenant = tenant
+	}
 	if p.dedupe != nil {
 		kept := recs[:0]
 		for _, r := range recs {
-			if r.HTTP != nil && r.HTTP.RequestID != "" && p.dedupe.seen(r.HTTP.RequestID, now) {
+			if r.HTTP != nil && r.HTTP.RequestID != "" && p.dedupe.seen(tenant, r.HTTP.RequestID, now) {
 				p.Duplicates.Add(1)
 				continue
 			}
@@ -47,7 +52,7 @@ func (p *Pipeline) Submit(recs []model.Record) {
 		return
 	}
 	p.Records.Add(uint64(len(recs)))
-	p.engine.Observe(recs, now)
+	p.engine.ObserveTenant(tenant, recs, now)
 	p.hub.Publish(recs)
 	p.red.observe(recs)
 	if p.store != nil {
@@ -55,7 +60,9 @@ func (p *Pipeline) Submit(recs []model.Record) {
 	}
 }
 
-// dedupe remembers request IDs, as 64-bit hashes, in two generations that
+// dedupe remembers request IDs, as 64-bit hashes of tenant and ID (so one
+// tenant cannot suppress another's records by reusing its request IDs), in
+// two generations that
 // rotate every window, so an ID is remembered for between one and two
 // windows. Each generation is capped (maxPerGen): under a flood it rotates
 // early, which shortens the window instead of growing memory.
@@ -81,8 +88,13 @@ func newDedupe(window time.Duration, maxEntries int) *dedupe {
 	return d
 }
 
-func (d *dedupe) seen(id string, now time.Time) bool {
-	h := maphash.String(d.seed, id)
+func (d *dedupe) seen(tenant, id string, now time.Time) bool {
+	var mh maphash.Hash
+	mh.SetSeed(d.seed)
+	mh.WriteString(tenant)
+	mh.WriteByte(0)
+	mh.WriteString(id)
+	h := mh.Sum64()
 	sh := &d.shards[h%uint64(len(d.shards))]
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -108,63 +120,63 @@ type redMetrics struct {
 	duration *prometheus.HistogramVec
 
 	mu    sync.Mutex
-	known map[[2]string]bool
+	known map[[3]string]bool
 	limit int
 }
 
 func newRED(reg prometheus.Registerer) *redMetrics {
 	m := &redMetrics{
 		records: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "signalbox_log_records_total", Help: "Log records received, by service, environment and severity.",
-		}, []string{"service", "environment", "severity"}),
+			Name: "signalbox_log_records_total", Help: "Log records received, by tenant, service, environment and severity.",
+		}, []string{"tenant", "service", "environment", "severity"}),
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "signalbox_http_requests_total", Help: "Request logs received, by service, environment and status class.",
-		}, []string{"service", "environment", "code"}),
+			Name: "signalbox_http_requests_total", Help: "Request logs received, by tenant, service, environment and status class.",
+		}, []string{"tenant", "service", "environment", "code"}),
 		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "signalbox_http_request_duration_seconds", Help: "Request duration reported by request logs.",
 			Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30},
-		}, []string{"service", "environment"}),
-		known: map[[2]string]bool{},
+		}, []string{"tenant", "service", "environment"}),
+		known: map[[3]string]bool{},
 		limit: 2000,
 	}
 	reg.MustRegister(m.records, m.requests, m.duration)
 	return m
 }
 
-func (m *redMetrics) labels(svc, env string) (string, string) {
-	k := [2]string{svc, env}
+func (m *redMetrics) labels(tenant, svc, env string) (string, string, string) {
+	k := [3]string{tenant, svc, env}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.known[k] {
-		return svc, env
+		return tenant, svc, env
 	}
 	if len(m.known) >= m.limit {
-		return "_other", "_other"
+		return "_other", "_other", "_other"
 	}
 	m.known[k] = true
-	return svc, env
+	return tenant, svc, env
 }
 
 func (m *redMetrics) observe(recs []model.Record) {
-	type rk struct{ svc, env, sev string }
-	type qk struct{ svc, env, code string }
+	type rk struct{ tenant, svc, env, sev string }
+	type qk struct{ tenant, svc, env, code string }
 	recCount := map[rk]float64{}
 	reqCount := map[qk]float64{}
 	for i := range recs {
 		r := &recs[i]
-		svc, env := m.labels(r.Service, r.Environment)
-		recCount[rk{svc, env, r.Severity.String()}]++
+		tn, svc, env := m.labels(r.Tenant, r.Service, r.Environment)
+		recCount[rk{tn, svc, env, r.Severity.String()}]++
 		if h := r.HTTP; h != nil {
-			reqCount[qk{svc, env, strconv.Itoa(h.Status/100) + "xx"}]++
+			reqCount[qk{tn, svc, env, strconv.Itoa(h.Status/100) + "xx"}]++
 			if h.DurationMs >= 0 {
-				m.duration.WithLabelValues(svc, env).Observe(h.DurationMs / 1000)
+				m.duration.WithLabelValues(tn, svc, env).Observe(h.DurationMs / 1000)
 			}
 		}
 	}
 	for k, v := range recCount {
-		m.records.WithLabelValues(k.svc, k.env, k.sev).Add(v)
+		m.records.WithLabelValues(k.tenant, k.svc, k.env, k.sev).Add(v)
 	}
 	for k, v := range reqCount {
-		m.requests.WithLabelValues(k.svc, k.env, k.code).Add(v)
+		m.requests.WithLabelValues(k.tenant, k.svc, k.env, k.code).Add(v)
 	}
 }

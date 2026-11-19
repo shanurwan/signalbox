@@ -15,6 +15,8 @@ Most hosting dashboards alert on CPU, memory and disk. The failures your users a
 - **Live tail:** `GET /tail` streams matching records as server-sent events, filtered on the server.
 - **Optional storage:** batches into ClickHouse with a TTL, for search and longer history.
 - **Metrics:** request rate, errors and duration per service in Prometheus format, ready for VictoriaMetrics or Prometheus to scrape, plus signalbox's own health.
+- **Tenants:** one instance can serve many teams or projects. Each has its own tokens, rules, receivers, alerts, live tail and stored logs, with limits on rate, groups, rules and receivers. One tenant can't see another's data or crowd it out.
+- **Query API:** request rate, error ratio and latency quantiles over time, and log search, from ClickHouse, scoped to the caller's tenant.
 
 ## Quick start
 
@@ -93,6 +95,33 @@ Operators are `>`, `>=`, `<` and `<=`. A `<` rule (for example `count < 1`) dete
 
 The whole config can also come from the `SIGNALBOX_CONFIG_YAML` environment variable. `${VAR}` references are expanded from the environment, and a receiver whose URL or key is empty is switched off with a warning instead of failing startup. A complete example is [examples/signalbox.yaml](examples/signalbox.yaml).
 
+## Tenants
+
+With no tenants created, everything belongs to the `default` tenant, using the tokens in the config file. To serve several teams or projects, the operator creates tenants with the `api_token`:
+
+```sh
+curl -X PUT https://SIGNALBOX/api/tenants/shop -H 'Authorization: Bearer API_TOKEN' \
+  -d '{"limits": {"records_per_second": 5000, "max_series": 2000, "max_rules": 50}}'
+# {"id": "shop", "ingest_token": "sb_in_...", "api_token": "sb_api_...", ...}   tokens are shown once
+```
+
+The tenant sends with its ingest token and manages its own receivers and rules with its API token, in the same form as the config file:
+
+```sh
+curl -X PUT https://SIGNALBOX/api/receivers/team -H 'Authorization: Bearer sb_api_...' \
+  -d '{"type": "slack", "url": "https://hooks.slack.com/services/..."}'
+curl -X PUT https://SIGNALBOX/api/rules/checkout-5xx -H 'Authorization: Bearer sb_api_...' --data-binary @- <<'EOF'
+when: error_ratio > 0.05
+min_requests: 50
+match: {service: [checkout]}
+window: 5m
+for: 2m
+notify: [team]
+EOF
+```
+
+Rules in the config file are platform rules. They apply to every tenant separately, and `notify` names are looked up among each tenant's own receivers. Defaults for new tenants' limits go under `tenant_defaults:`. [docs/design.md](docs/design.md#tenants) covers the isolation guarantees and what was rejected.
+
 ## How it behaves when things fail
 
 Each scenario below was run against a live stack: signalbox and ClickHouse at 20,000 request logs/s, with an alert rule on the 5xx ratio and a webhook receiver recording what arrived.
@@ -119,18 +148,26 @@ All numbers are from one laptop-class machine (Intel i7-1265U, 12 threads) runni
 
 ## Endpoints
 
+Ingest takes an ingest token, which picks the tenant. Everything else takes an API token and covers that tenant only. The config file's `api_token` is the admin token: it sees every tenant, can act for one with `?tenant=`, and manages tenants.
+
 | | |
 |---|---|
-| `POST /v1/logs`, `POST /ingest`, gRPC `:4317` | ingest (`ingest_token`) |
-| `GET /tail?service=&environment=&level=&q=&http=1` | live tail as server-sent events (`api_token`) |
-| `GET /api/alerts`, `GET /api/rules` | current alerts and loaded rules (`api_token`) |
-| `POST /api/test-notify?receiver=<name>` | send a test notification (`api_token`) |
-| `GET /metrics` | Prometheus metrics (`api_token`) |
+| `POST /v1/logs`, `POST /ingest`, gRPC `:4317` | ingest |
+| `GET /tail?service=&environment=&level=&q=&http=1` | live tail as server-sent events |
+| `GET /api/alerts` | pending and firing alerts |
+| `GET`, `PUT`, `DELETE /api/rules[/{name}]` | platform rules (read only) and the tenant's own rules |
+| `GET`, `PUT`, `DELETE /api/receivers[/{name}]` | the tenant's receivers (URLs are not shown back) |
+| `POST /api/test-notify?receiver=<name>` | send a test notification |
+| `GET /api/requests?service=&environment=&path=&since=1h&step=1m` | request rate, 5xx ratio, p50/p90/p99 over time (needs ClickHouse) |
+| `GET /api/logs?service=&environment=&level=&q=&since=15m&limit=100` | recent records, newest first (needs ClickHouse) |
+| `GET /api/usage` | the tenant's limits and usage |
+| `GET /api/tenants`, `PUT`, `DELETE /api/tenants/{id}` | manage tenants (admin) |
+| `GET /metrics` | Prometheus metrics (admin) |
 | `GET /healthz` | liveness |
 
 ## Design
 
-[docs/design.md](docs/design.md) is the engineering requirements document. It covers the alert state machine, why alerting comes before storage, delivery guarantees, restart warm-up, late and duplicate data, and how to scale past one node.
+[docs/design.md](docs/design.md) is the engineering requirements document. It covers where signalbox fits beside a metrics pipeline for stateless and stateful workloads, the alert state machine, tenant isolation, why alerting comes before storage, delivery guarantees, restart warm-up, late and duplicate data, and how to scale past one node.
 
 ## License
 

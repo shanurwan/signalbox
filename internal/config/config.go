@@ -2,6 +2,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -22,11 +23,19 @@ type Config struct {
 	MaxLateness  time.Duration `yaml:"max_lateness"`
 	DedupeWindow time.Duration `yaml:"dedupe_window"`
 	// DedupeMaxEntries caps remembered request IDs per generation.
-	DedupeMaxEntries int         `yaml:"dedupe_max_entries"`
-	Mapping          Mapping     `yaml:"mapping"`
-	ClickHouse       *ClickHouse `yaml:"clickhouse"`
-	Receivers        []Receiver  `yaml:"receivers"`
-	Rules            []Rule      `yaml:"rules"`
+	DedupeMaxEntries int `yaml:"dedupe_max_entries"`
+	// TenantDefaults are the limits a tenant created through the API gets
+	// unless the request sets its own. The default tenant has no limits.
+	TenantDefaults TenantLimits `yaml:"tenant_defaults"`
+	// TenantReceiversAllowPrivate lets receivers created by tenants point at
+	// loopback, private and link-local addresses. Off by default: otherwise
+	// any tenant could make signalbox send requests into the network it runs
+	// in. Receivers in this file are trusted and never restricted.
+	TenantReceiversAllowPrivate bool        `yaml:"tenant_receivers_allow_private"`
+	Mapping                     Mapping     `yaml:"mapping"`
+	ClickHouse                  *ClickHouse `yaml:"clickhouse"`
+	Receivers                   []Receiver  `yaml:"receivers"`
+	Rules                       []Rule      `yaml:"rules"`
 
 	// Warnings are problems that do not stop startup.
 	Warnings []string `yaml:"-"`
@@ -44,6 +53,42 @@ type Mapping struct {
 	HTTPDurationMs []string `yaml:"http_duration_ms"`
 	HTTPDurationS  []string `yaml:"http_duration_s"`
 	RequestID      []string `yaml:"request_id"`
+}
+
+// TenantLimits keep one tenant from using up what others share. Zero means
+// no limit.
+type TenantLimits struct {
+	// RecordsPerSecond is the average ingest rate. A batch is accepted while
+	// the tenant's balance is positive, so large batches pass and the
+	// average still holds; Burst caps how much unused rate can be saved up.
+	RecordsPerSecond float64 `yaml:"records_per_second" json:"records_per_second"`
+	Burst            float64 `yaml:"burst" json:"burst"`
+	MaxSeries        int     `yaml:"max_series" json:"max_series"`
+	MaxRules         int     `yaml:"max_rules" json:"max_rules"`
+	MaxReceivers     int     `yaml:"max_receivers" json:"max_receivers"`
+}
+
+// Merge fills unset fields of l from d.
+func (l TenantLimits) Merge(d TenantLimits) TenantLimits {
+	if l.RecordsPerSecond == 0 {
+		l.RecordsPerSecond = d.RecordsPerSecond
+	}
+	if l.Burst == 0 {
+		l.Burst = d.Burst
+	}
+	if l.Burst == 0 {
+		l.Burst = 2 * l.RecordsPerSecond
+	}
+	if l.MaxSeries == 0 {
+		l.MaxSeries = d.MaxSeries
+	}
+	if l.MaxRules == 0 {
+		l.MaxRules = d.MaxRules
+	}
+	if l.MaxReceivers == 0 {
+		l.MaxReceivers = d.MaxReceivers
+	}
+	return l
 }
 
 type ClickHouse struct {
@@ -89,6 +134,11 @@ type Rule struct {
 	Severity        string         `yaml:"severity"`
 	Summary         string         `yaml:"summary"`
 	Notify          []string       `yaml:"notify"`
+
+	// NotifyAll is Notify as written. Notify keeps only the receivers that
+	// are on; a platform rule looks NotifyAll up among each tenant's own
+	// receivers.
+	NotifyAll []string `yaml:"-"`
 
 	// Filled from the fields above; unset means the default, 0s means zero.
 	ResolveAfter time.Duration `yaml:"-"`
@@ -190,22 +240,28 @@ func (c *Config) defaults() {
 			ch.Writers = 4
 		}
 	}
+	if d := &c.TenantDefaults; d.Burst == 0 {
+		d.Burst = 2 * d.RecordsPerSecond
+	}
 	for i := range c.Rules {
-		r := &c.Rules[i]
-		r.ResolveAfter = time.Minute
-		if r.ResolveAfterSet != nil {
-			r.ResolveAfter = *r.ResolveAfterSet
-		}
-		r.Repeat = 4 * time.Hour
-		if r.RepeatSet != nil {
-			r.Repeat = *r.RepeatSet
-		}
-		if len(r.GroupBy) == 0 {
-			r.GroupBy = []string{"service", "environment"}
-		}
-		if r.Severity == "" {
-			r.Severity = "warning"
-		}
+		c.Rules[i].defaults()
+	}
+}
+
+func (r *Rule) defaults() {
+	r.ResolveAfter = time.Minute
+	if r.ResolveAfterSet != nil {
+		r.ResolveAfter = *r.ResolveAfterSet
+	}
+	r.Repeat = 4 * time.Hour
+	if r.RepeatSet != nil {
+		r.Repeat = *r.RepeatSet
+	}
+	if len(r.GroupBy) == 0 {
+		r.GroupBy = []string{"service", "environment"}
+	}
+	if r.Severity == "" {
+		r.Severity = "warning"
 	}
 }
 
@@ -225,21 +281,12 @@ func (c *Config) validate() error {
 		if recv[r.Name] || off[r.Name] {
 			return fmt.Errorf("receiver %q defined twice", r.Name)
 		}
-		switch r.Type {
-		case "slack", "discord", "webhook":
-			if r.URL == "" {
-				off[r.Name] = true
-				c.Warnings = append(c.Warnings, fmt.Sprintf("receiver %q is off: url is empty", r.Name))
-				continue
-			}
-		case "pagerduty":
-			if r.RoutingKey == "" {
-				off[r.Name] = true
-				c.Warnings = append(c.Warnings, fmt.Sprintf("receiver %q is off: routing_key is empty", r.Name))
-				continue
-			}
-		default:
-			return fmt.Errorf("receiver %q: unknown type %q", r.Name, r.Type)
+		if err := r.check(); errors.Is(err, errEmpty) {
+			off[r.Name] = true
+			c.Warnings = append(c.Warnings, fmt.Sprintf("receiver %q is off: %v", r.Name, err))
+			continue
+		} else if err != nil {
+			return err
 		}
 		recv[r.Name] = true
 		active = append(active, r)
@@ -255,49 +302,8 @@ func (c *Config) validate() error {
 			return fmt.Errorf("rule %q defined twice", r.Name)
 		}
 		names[r.Name] = true
-		m := whenRe.FindStringSubmatch(r.When)
-		if m == nil {
-			return fmt.Errorf("rule %q: when %q must look like \"count > 20\"", r.Name, r.When)
-		}
-		r.Metric, r.Op = m[1], m[2]
-		v, err := strconv.ParseFloat(m[3], 64)
-		if err != nil {
-			return fmt.Errorf("rule %q: threshold: %w", r.Name, err)
-		}
-		r.Threshold = v
-		switch r.Metric {
-		case "count", "rate":
-		case "error_ratio":
-			r.Match.HTTPOnly = true
-		case "p50_ms", "p90_ms", "p95_ms", "p99_ms":
-			r.Match.HTTPOnly = true
-			q, _ := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(r.Metric, "p"), "_ms"))
-			r.Quantile = float64(q) / 100
-		default:
-			return fmt.Errorf("rule %q: unknown metric %q (count, rate, error_ratio, p50_ms, p90_ms, p95_ms, p99_ms)", r.Name, r.Metric)
-		}
-		if r.Window < time.Second {
-			return fmt.Errorf("rule %q: window must be at least 1s", r.Name)
-		}
-		if r.Window > 24*time.Hour {
-			return fmt.Errorf("rule %q: window must be at most 24h", r.Name)
-		}
-		if r.Match.MinSeverity != "" {
-			if _, ok := parseSev(r.Match.MinSeverity); !ok {
-				return fmt.Errorf("rule %q: unknown min_severity %q", r.Name, r.Match.MinSeverity)
-			}
-		}
-		for _, re := range []string{r.Match.Body, r.Match.Path} {
-			if re != "" {
-				if _, err := regexp.Compile(re); err != nil {
-					return fmt.Errorf("rule %q: %w", r.Name, err)
-				}
-			}
-		}
-		for _, g := range r.GroupBy {
-			if g != "service" && g != "environment" && g != "path" && g != "method" && !strings.HasPrefix(g, "attr.") {
-				return fmt.Errorf("rule %q: group_by %q (service, environment, path, method or attr.<key>)", r.Name, g)
-			}
+		if err := r.check(); err != nil {
+			return err
 		}
 		var notify []string
 		for _, n := range r.Notify {
@@ -306,10 +312,13 @@ func (c *Config) validate() error {
 				notify = append(notify, n)
 			case off[n]:
 			default:
-				return fmt.Errorf("rule %q: unknown receiver %q", r.Name, n)
+				// Not an error: with tenants, a platform rule can name a
+				// receiver that each tenant defines for itself.
+				c.Warnings = append(c.Warnings, fmt.Sprintf("rule %q: receiver %q is not in this file; only tenants "+
+					"that create a receiver with that name get these alerts", r.Name, n))
 			}
 		}
-		r.Notify = notify
+		r.NotifyAll, r.Notify = r.Notify, notify
 	}
 	if len(c.Rules) > 0 && len(c.Receivers) == 0 {
 		c.Warnings = append(c.Warnings, "no receiver is configured: alerts show in /api/alerts and the logs only")
@@ -337,3 +346,125 @@ func parseSev(s string) (int, bool) {
 
 // SeverityNumber returns the OpenTelemetry number for a severity word.
 func SeverityNumber(s string) int { n, _ := parseSev(s); return n }
+
+var errEmpty = errors.New("empty")
+
+func (r *Receiver) check() error {
+	switch r.Type {
+	case "slack", "discord", "webhook":
+		if r.URL == "" {
+			return fmt.Errorf("url is %w", errEmpty)
+		}
+		if !strings.HasPrefix(r.URL, "https://") && !strings.HasPrefix(r.URL, "http://") {
+			return fmt.Errorf("receiver %q: url must start with http:// or https://", r.Name)
+		}
+	case "pagerduty":
+		if r.RoutingKey == "" {
+			return fmt.Errorf("routing_key is %w", errEmpty)
+		}
+	default:
+		return fmt.Errorf("receiver %q: unknown type %q", r.Name, r.Type)
+	}
+	return nil
+}
+
+// check validates a rule and parses its condition. It does not look at
+// receivers, which depend on who owns the rule.
+func (r *Rule) check() error {
+	m := whenRe.FindStringSubmatch(r.When)
+	if m == nil {
+		return fmt.Errorf("rule %q: when %q must look like \"count > 20\"", r.Name, r.When)
+	}
+	r.Metric, r.Op = m[1], m[2]
+	v, err := strconv.ParseFloat(m[3], 64)
+	if err != nil {
+		return fmt.Errorf("rule %q: threshold: %w", r.Name, err)
+	}
+	r.Threshold = v
+	switch r.Metric {
+	case "count", "rate":
+	case "error_ratio":
+		r.Match.HTTPOnly = true
+	case "p50_ms", "p90_ms", "p95_ms", "p99_ms":
+		r.Match.HTTPOnly = true
+		q, _ := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(r.Metric, "p"), "_ms"))
+		r.Quantile = float64(q) / 100
+	default:
+		return fmt.Errorf("rule %q: unknown metric %q (count, rate, error_ratio, p50_ms, p90_ms, p95_ms, p99_ms)", r.Name, r.Metric)
+	}
+	if r.Window < time.Second {
+		return fmt.Errorf("rule %q: window must be at least 1s", r.Name)
+	}
+	if r.Window > 24*time.Hour {
+		return fmt.Errorf("rule %q: window must be at most 24h", r.Name)
+	}
+	if r.Match.MinSeverity != "" {
+		if _, ok := parseSev(r.Match.MinSeverity); !ok {
+			return fmt.Errorf("rule %q: unknown min_severity %q", r.Name, r.Match.MinSeverity)
+		}
+	}
+	for _, re := range []string{r.Match.Body, r.Match.Path} {
+		if re != "" {
+			if _, err := regexp.Compile(re); err != nil {
+				return fmt.Errorf("rule %q: %w", r.Name, err)
+			}
+		}
+	}
+	for _, g := range r.GroupBy {
+		if g != "service" && g != "environment" && g != "path" && g != "method" && !strings.HasPrefix(g, "attr.") {
+			return fmt.Errorf("rule %q: group_by %q (service, environment, path, method or attr.<key>)", r.Name, g)
+		}
+	}
+	return nil
+}
+
+var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,62}$`)
+
+// ValidName reports whether s can name a tenant, rule or receiver created
+// through the API: lower case, digits, '_', '.' and '-', up to 63 bytes.
+func ValidName(s string) bool { return nameRe.MatchString(s) }
+
+func strictDecode(raw []byte, v any) error {
+	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
+	dec.KnownFields(true)
+	return dec.Decode(v)
+}
+
+// ParseRule reads one rule as YAML or JSON (the API accepts either), fills
+// defaults and validates it. Receivers named in notify are left to the caller.
+func ParseRule(raw []byte) (Rule, error) {
+	var r Rule
+	if err := strictDecode(raw, &r); err != nil {
+		return r, fmt.Errorf("parse rule: %w", err)
+	}
+	if !ValidName(r.Name) {
+		return r, fmt.Errorf("rule name %q: use lower case letters, digits, '_', '.' or '-'", r.Name)
+	}
+	if len(r.Match.Body) > 1024 || len(r.Match.Path) > 1024 {
+		return r, fmt.Errorf("rule %q: patterns are limited to 1024 bytes", r.Name)
+	}
+	r.defaults()
+	if err := r.check(); err != nil {
+		return r, err
+	}
+	r.NotifyAll = r.Notify
+	return r, nil
+}
+
+// ParseReceiver reads one receiver as YAML or JSON and validates it.
+func ParseReceiver(raw []byte) (Receiver, error) {
+	var r Receiver
+	if err := strictDecode(raw, &r); err != nil {
+		return r, fmt.Errorf("parse receiver: %w", err)
+	}
+	if !ValidName(r.Name) {
+		return r, fmt.Errorf("receiver name %q: use lower case letters, digits, '_', '.' or '-'", r.Name)
+	}
+	if err := r.check(); err != nil {
+		if errors.Is(err, errEmpty) {
+			return r, fmt.Errorf("receiver %q: %v", r.Name, err)
+		}
+		return r, err
+	}
+	return r, nil
+}

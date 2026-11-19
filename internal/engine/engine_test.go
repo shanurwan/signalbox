@@ -4,6 +4,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"sort"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -363,20 +364,21 @@ func benchBatch(now time.Time, svc func(i int) string) []model.Record {
 }
 
 // BenchmarkObserve: each batch comes from one service, as an OTLP export
-// grouped by resource does. 20 services, 3 rules.
+// grouped by resource does. 20 services, 3 rules. It calls ObserveTenant,
+// as the pipeline does: a batch always has one tenant.
 func BenchmarkObserve(b *testing.B) {
 	e := benchEngine()
 	now := time.Now()
 	batches := make([][]model.Record, 20)
 	for s := range batches {
-		name := "svc" + itoa(s)
+		name := "svc" + strconv.Itoa(s)
 		batches[s] = benchBatch(now, func(int) string { return name })
 	}
 	var n atomic.Uint64
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			e.Observe(batches[n.Add(1)%20], now)
+			e.ObserveTenant(model.DefaultTenant, batches[n.Add(1)%20], now)
 		}
 	})
 	b.ReportMetric(float64(b.N)*1000/b.Elapsed().Seconds(), "records/s")
@@ -387,11 +389,11 @@ func BenchmarkObserve(b *testing.B) {
 func BenchmarkObserveInterleaved(b *testing.B) {
 	e := benchEngine()
 	now := time.Now()
-	batch := benchBatch(now, func(i int) string { return "svc" + itoa(i%20) })
+	batch := benchBatch(now, func(i int) string { return "svc" + strconv.Itoa(i%20) })
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			e.Observe(batch, now)
+			e.ObserveTenant(model.DefaultTenant, batch, now)
 		}
 	})
 	b.ReportMetric(float64(b.N)*1000/b.Elapsed().Seconds(), "records/s")

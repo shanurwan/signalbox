@@ -88,11 +88,13 @@ func (c *ClickHouse) query(ctx context.Context, q string, body io.Reader, gz boo
 
 func (c *ClickHouse) table() string { return c.cfg.Database + "." + c.cfg.Table }
 
-// DDL is the table signalbox writes to. Sorting by service then time makes
-// "this service, last hour" reads touch a narrow range; whole days expire at
-// once through partition drops.
+// DDL is the table signalbox writes to. Sorting by tenant, service, then
+// time makes "this tenant's service, last hour" reads touch a narrow range,
+// and keeps one tenant's rows out of another's granules; whole days expire
+// at once through partition drops.
 func (c *ClickHouse) DDL() string {
 	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+    tenant       LowCardinality(String) DEFAULT 'default',
     ts           DateTime64(9, 'UTC') CODEC(Delta, ZSTD(1)),
     service      LowCardinality(String),
     environment  LowCardinality(String),
@@ -102,12 +104,12 @@ func (c *ClickHouse) DDL() string {
     http_method  LowCardinality(String),
     http_path    String CODEC(ZSTD(3)),
     http_status  UInt16,
-    duration_ms  Float32,
+    duration_ms  Float32 DEFAULT -1,
     request_id   String CODEC(ZSTD(3)),
     INDEX body_tokens body TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 4
 ) ENGINE = MergeTree
 PARTITION BY toDate(ts)
-ORDER BY (service, environment, ts)
+ORDER BY (tenant, service, environment, ts)
 TTL toDateTime(ts) + INTERVAL %d DAY DELETE
 SETTINGS ttl_only_drop_parts = 1`, c.table(), c.cfg.RetentionDays)
 }
@@ -117,6 +119,11 @@ func (c *ClickHouse) Init(ctx context.Context) error {
 	back := time.Second
 	for {
 		err := c.query(ctx, c.DDL(), nil, false)
+		if err == nil {
+			// Tables created before tenants existed get the column; their
+			// rows belong to the default tenant.
+			err = c.query(ctx, "ALTER TABLE "+c.table()+" ADD COLUMN IF NOT EXISTS tenant LowCardinality(String) DEFAULT 'default' FIRST", nil, false)
+		}
 		if err == nil {
 			return nil
 		}

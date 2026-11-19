@@ -47,7 +47,9 @@ func TestEncodeIsValidJSONEachRow(t *testing.T) {
 	if err := json.Unmarshal(lines[2], &row); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := row["duration_ms"]; ok {
-		t.Fatal("a missing duration must be omitted, not written as -1")
+	// Written as -1 rather than omitted: a table created by an older version
+	// defaults the column to 0, which latency quantiles would count.
+	if row["duration_ms"] != float64(-1) || row["tenant"] != "default" {
+		t.Fatalf("row 3: %#v", row)
 	}
 }

@@ -18,7 +18,13 @@ func encode(recs []model.Record) ([]byte, error) {
 	line := make([]byte, 0, 1024)
 	for i := range recs {
 		r := &recs[i]
-		line = append(line[:0], `{"ts":"`...)
+		line = append(line[:0], `{"tenant":`...)
+		tenant := r.Tenant
+		if tenant == "" {
+			tenant = model.DefaultTenant
+		}
+		line = appendString(line, tenant)
+		line = append(line, `,"ts":"`...)
 		line = r.Time.UTC().AppendFormat(line, "2006-01-02 15:04:05.000000000")
 		line = append(line, `","service":`...)
 		line = appendString(line, r.Service)
@@ -49,9 +55,11 @@ func encode(recs []model.Record) ([]byte, error) {
 			line = strconv.AppendInt(line, int64(h.Status), 10)
 			line = append(line, `,"request_id":`...)
 			line = appendString(line, h.RequestID)
+			line = append(line, `,"duration_ms":`...)
 			if h.DurationMs >= 0 {
-				line = append(line, `,"duration_ms":`...)
 				line = strconv.AppendFloat(line, h.DurationMs, 'f', -1, 32)
+			} else {
+				line = append(line, `-1`...) // unknown, so quantiles can leave it out
 			}
 		}
 		line = append(line, '}', '\n')

@@ -155,10 +155,10 @@ func TestMetricsExposeREDAndSelf(t *testing.T) {
 	resp, _ := http.DefaultClient.Do(req)
 	b, _ := io.ReadAll(resp.Body)
 	for _, want := range []string{
-		`signalbox_http_requests_total{code="5xx",environment="",service="api"} 2`,
-		`signalbox_http_requests_total{code="2xx",environment="",service="api"} 8`,
+		`signalbox_http_requests_total{code="5xx",environment="",service="api",tenant="default"} 2`,
+		`signalbox_http_requests_total{code="2xx",environment="",service="api",tenant="default"} 8`,
 		`signalbox_ingested_records_total 10`,
-		`signalbox_http_request_duration_seconds_count{environment="",service="api"} 10`,
+		`signalbox_http_request_duration_seconds_count{environment="",service="api",tenant="default"} 10`,
 	} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("metrics missing %q", want)

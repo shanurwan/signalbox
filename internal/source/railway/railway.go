@@ -612,7 +612,9 @@ func (s *Source) session(ctx context.Context, query string, vars func() map[stri
 	subscribe := func() (string, error) {
 		seq++
 		id := strconv.Itoa(seq)
-		payload, _ := json.Marshal(map[string]any{"query": query, "variables": vars()})
+		v := vars()
+		s.log.Debug("subscribe", "id", id, "beforeDate", v["beforeDate"])
+		payload, _ := json.Marshal(map[string]any{"query": query, "variables": v})
 		return id, write(wsMsg{ID: id, Type: "subscribe", Payload: payload})
 	}
 	id, err := subscribe()
@@ -653,6 +655,11 @@ func (s *Source) session(ctx context.Context, query string, vars func() map[stri
 				if json.Unmarshal(m.Payload, &p) == nil {
 					if raw, ok := p.Data[field]; ok {
 						delivered = true
+						if s.log.Enabled(ctx, slog.LevelDebug) {
+							var n []json.RawMessage
+							json.Unmarshal(raw, &n)
+							s.log.Debug("next", "id", id, "records", len(n))
+						}
 						handle(raw)
 					}
 				}

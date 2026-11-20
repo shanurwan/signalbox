@@ -84,18 +84,21 @@ func (f *fakeRailway) handler() http.Handler {
 					return map[string]any{"requestId": id, "timestamp": ts(s), "method": "POST", "path": "/pay",
 						"host": "checkout.up.railway.app", "httpStatus": status, "totalDuration": 120, "edgeRegion": "asia"}
 				}
+				next := func(logs ...any) {
+					send(map[string]any{"id": m.ID, "type": "next", "payload": map[string]any{"data": map[string]any{"httpLogs": logs}}})
+				}
 				switch n {
-				case 1: // two logs, then the server completes the stream
-					send(map[string]any{"id": m.ID, "type": "next", "payload": map[string]any{"data": map[string]any{
-						"httpLogs": []any{log("r1", 1, 200), log("r2", 2, 502)}}}})
+				case 1:
+					// As on Railway, a later batch can hold a log older than one
+					// already delivered: r2 (t+2) arrives after r3 (t+3).
+					next(log("r1", 1, 200), log("r3", 3, 200))
+					next(log("r2", 2, 502))
 					send(map[string]any{"id": m.ID, "type": "complete"})
-				case 2: // resubscribed: the server repeats r2 (not newer), adds r3, then drops the connection
-					send(map[string]any{"id": m.ID, "type": "next", "payload": map[string]any{"data": map[string]any{
-						"httpLogs": []any{log("r2", 2, 502), log("r3", 3, 200)}}}})
+				case 2: // resubscribed with an overlap: r2 and r3 again, plus r4; then the connection drops
+					next(log("r2", 2, 502), log("r3", 3, 200), log("r4", 4, 503))
 					return
-				default: // after reconnecting
-					send(map[string]any{"id": m.ID, "type": "next", "payload": map[string]any{"data": map[string]any{
-						"httpLogs": []any{log("r4", 4, 503)}}}})
+				default: // reconnected: r4 again, plus r5
+					next(log("r4", 4, 503), log("r5", 5, 200))
 				}
 			}
 		}
@@ -112,7 +115,7 @@ func TestRailwaySourceStreamsResubscribesAndReconnects(t *testing.T) {
 	var got []model.Record
 	src := New(Config{ProjectToken: "tok", EnvironmentID: "e1", Tenant: "acme",
 		APIURL: srv.URL + "/graphql/v2", StreamURL: "ws" + strings.TrimPrefix(srv.URL, "http") + "/graphql/internal",
-		Refresh: time.Hour}, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Refresh: time.Hour, Overlap: 10 * time.Second}, slog.New(slog.NewTextHandler(io.Discard, nil)),
 		func(tenant string, recs []model.Record) {
 			if tenant != "acme" {
 				t.Errorf("tenant %q", tenant)
@@ -130,7 +133,7 @@ func TestRailwaySourceStreamsResubscribesAndReconnects(t *testing.T) {
 		mu.Lock()
 		n := len(got)
 		mu.Unlock()
-		if n >= 4 {
+		if n >= 5 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -144,10 +147,10 @@ func TestRailwaySourceStreamsResubscribesAndReconnects(t *testing.T) {
 	for _, r := range got {
 		ids = append(ids, r.HTTP.RequestID)
 	}
-	if strings.Join(ids, ",") != "r1,r2,r3,r4" {
-		t.Fatalf("records %v, want r1,r2,r3,r4 with the repeated r2 filtered", ids)
+	if strings.Join(ids, ",") != "r1,r3,r2,r4,r5" {
+		t.Fatalf("records %v, want r1,r3,r2,r4,r5: the late r2 kept, repeats dropped", ids)
 	}
-	r := got[1]
+	r := got[2]
 	if r.Service != "checkout" || r.Environment != "production" || r.HTTP.Status != 502 || r.HTTP.DurationMs != 120 ||
 		r.HTTP.Method != "POST" || r.Attrs["deployment_id"] != "d1" {
 		t.Fatalf("mapping: %+v %+v", r, r.HTTP)
@@ -163,15 +166,15 @@ func TestRailwaySourceStreamsResubscribesAndReconnects(t *testing.T) {
 	if f.subs[0]["deploymentId"] != "d1" {
 		t.Fatalf("subscribed to %v, want the live deployment d1", f.subs[0]["deploymentId"])
 	}
-	// Each new subscription starts after the newest log already seen.
-	if want := f.t0.Add(2 * time.Second).UTC().Format(time.RFC3339Nano); f.subs[1]["beforeDate"] != want {
+	// Each new subscription starts one overlap before the newest log seen.
+	if want := f.t0.Add(3*time.Second - 10*time.Second).UTC().Format(time.RFC3339Nano); f.subs[1]["beforeDate"] != want {
 		t.Fatalf("resubscribe from %v, want %s", f.subs[1]["beforeDate"], want)
 	}
-	if want := f.t0.Add(3 * time.Second).UTC().Format(time.RFC3339Nano); f.subs[2]["beforeDate"] != want {
+	if want := f.t0.Add(4*time.Second - 10*time.Second).UTC().Format(time.RFC3339Nano); f.subs[2]["beforeDate"] != want {
 		t.Fatalf("reconnect from %v, want %s", f.subs[2]["beforeDate"], want)
 	}
-	if src.Stats.Reconnects.Load() < 1 || src.Stats.HTTPRecords.Load() != 4 {
-		t.Fatalf("stats: reconnects %d records %d", src.Stats.Reconnects.Load(), src.Stats.HTTPRecords.Load())
+	if src.Stats.Reconnects.Load() < 1 || src.Stats.HTTPRecords.Load() != 5 || src.Stats.Repeats.Load() != 3 {
+		t.Fatalf("stats: reconnects %d records %d repeats %d", src.Stats.Reconnects.Load(), src.Stats.HTTPRecords.Load(), src.Stats.Repeats.Load())
 	}
 }
 

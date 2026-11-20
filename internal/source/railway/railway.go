@@ -39,6 +39,11 @@ type Config struct {
 	StreamURL     string `yaml:"stream_url"`
 	// Refresh is how often the list of live deployments is re-read.
 	Refresh time.Duration `yaml:"refresh"`
+	// Overlap is how far before the newest record seen a resubscription
+	// starts. Railway's streams do not deliver records in timestamp order,
+	// so a later batch can hold records older than one already seen; the
+	// overlap re-reads them and identity-based dedupe drops the repeats.
+	Overlap time.Duration `yaml:"overlap"`
 }
 
 func (c *Config) Defaults() {
@@ -52,6 +57,9 @@ func (c *Config) Defaults() {
 	}
 	if c.Refresh == 0 {
 		c.Refresh = 15 * time.Second
+	}
+	if c.Overlap == 0 {
+		c.Overlap = 2 * time.Minute
 	}
 	if c.Tenant == "" {
 		c.Tenant = model.DefaultTenant
@@ -74,6 +82,7 @@ func on(b *bool) bool { return b == nil || *b }
 type Stats struct {
 	HTTPRecords, DeployRecords atomic.Uint64
 	Reconnects, Errors         atomic.Uint64
+	Repeats                    atomic.Uint64 // records seen before, dropped
 	Streams                    atomic.Int64
 	// LagMs records how long after its own timestamp each record reached
 	// signalbox: Railway's log pipeline latency as seen from outside.
@@ -239,6 +248,33 @@ func (s *Source) names(serviceID string) (string, string) {
 	return name, s.envName
 }
 
+// seen remembers record identities for a while, so overlapping
+// subscriptions don't deliver a record twice. Owned by one stream goroutine.
+type seen struct {
+	ttl   time.Duration
+	m     map[string]time.Time
+	prune time.Time
+}
+
+func newSeen(ttl time.Duration) *seen { return &seen{ttl: ttl, m: map[string]time.Time{}} }
+
+// first reports whether key is new, and remembers it.
+func (s *seen) first(key string, now time.Time) bool {
+	if now.Sub(s.prune) > s.ttl/4 {
+		for k, t := range s.m {
+			if now.Sub(t) > s.ttl {
+				delete(s.m, k)
+			}
+		}
+		s.prune = now
+	}
+	if _, ok := s.m[key]; ok {
+		return false
+	}
+	s.m[key] = now
+	return true
+}
+
 // ---- run ---------------------------------------------------------------------
 
 // Run streams until ctx ends.
@@ -316,12 +352,13 @@ type httpLog struct {
 
 func (s *Source) httpStream(ctx context.Context, d deployment) {
 	// beforeDate is the exclusive lower bound: the stream returns logs newer
-	// than it. Starting from now skips history; after that, from the newest
-	// log seen, so a resubscribe neither skips nor repeats.
-	since := time.Now()
+	// than it. Each (re)subscription starts Overlap before the newest log seen,
+	// because logs do not arrive in timestamp order; request IDs drop repeats.
+	newest := time.Now()
+	dup := newSeen(2*s.cfg.Overlap + time.Minute)
 	vars := func() map[string]any {
 		return map[string]any{"deploymentId": d.ID, "filter": "", "beforeLimit": 5000,
-			"beforeDate": since.UTC().Format(time.RFC3339Nano)}
+			"beforeDate": newest.Add(-s.cfg.Overlap).UTC().Format(time.RFC3339Nano)}
 	}
 	s.stream(ctx, "http", httpLogsSub, vars, "httpLogs", func(raw json.RawMessage) {
 		var logs []httpLog
@@ -332,7 +369,12 @@ func (s *Source) httpStream(ctx context.Context, d deployment) {
 		now := time.Now()
 		recs := make([]model.Record, 0, len(logs))
 		for _, l := range logs {
-			if !l.Timestamp.After(since) {
+			key := l.RequestID
+			if key == "" {
+				key = l.Timestamp.String() + l.Method + l.Path
+			}
+			if !dup.first(key, now) {
+				s.Stats.Repeats.Add(1)
 				continue
 			}
 			svc, env := s.names(d.ServiceID)
@@ -345,8 +387,8 @@ func (s *Source) httpStream(ctx context.Context, d deployment) {
 			s.Stats.observeLag(float64(now.Sub(l.Timestamp).Milliseconds()))
 		}
 		for _, l := range logs {
-			if l.Timestamp.After(since) {
-				since = l.Timestamp
+			if l.Timestamp.After(newest) {
+				newest = l.Timestamp
 			}
 		}
 		if len(recs) > 0 {
@@ -393,10 +435,11 @@ func (s *Source) deployLogs(ctx context.Context) {
 			}
 		}
 	}()
-	since := time.Now()
+	newest := time.Now()
+	dup := newSeen(2*s.cfg.Overlap + time.Minute)
 	vars := func() map[string]any {
 		return map[string]any{"environmentId": s.cfg.EnvironmentID, "filter": "", "beforeLimit": 5000,
-			"beforeDate": since.UTC().Format(time.RFC3339Nano)}
+			"beforeDate": newest.Add(-s.cfg.Overlap).UTC().Format(time.RFC3339Nano)}
 	}
 	s.stream(ctx, "deploy", environmentLogsSub, vars, "environmentLogs", func(raw json.RawMessage) {
 		var logs []environmentLog
@@ -407,7 +450,13 @@ func (s *Source) deployLogs(ctx context.Context) {
 		now := time.Now()
 		recs := make([]model.Record, 0, len(logs))
 		for _, l := range logs {
-			if !l.Timestamp.After(since) || l.Tags.ServiceID == "" {
+			if l.Tags.ServiceID == "" {
+				continue
+			}
+			// Deploy logs carry no ID; their timestamp has nanosecond
+			// precision, so with the deployment and text it identifies a line.
+			if !dup.first(l.Tags.DeploymentID+"|"+l.Timestamp.Format(time.RFC3339Nano)+"|"+l.Message, now) {
+				s.Stats.Repeats.Add(1)
 				continue
 			}
 			svc, env := s.names(l.Tags.ServiceID)
@@ -427,8 +476,8 @@ func (s *Source) deployLogs(ctx context.Context) {
 			s.Stats.observeLag(float64(now.Sub(l.Timestamp).Milliseconds()))
 		}
 		for _, l := range logs {
-			if l.Timestamp.After(since) {
-				since = l.Timestamp
+			if l.Timestamp.After(newest) {
+				newest = l.Timestamp
 			}
 		}
 		if len(recs) > 0 {

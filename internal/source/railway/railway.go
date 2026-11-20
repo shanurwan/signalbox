@@ -40,10 +40,11 @@ type Config struct {
 	// Refresh is how often the list of live deployments is re-read.
 	Refresh time.Duration `yaml:"refresh"`
 	// Overlap is how far before the newest record seen a resubscription
-	// starts. Railway's streams do not deliver records in timestamp order,
-	// so a later batch can hold records older than one already seen; the
-	// overlap re-reads them and identity-based dedupe drops the repeats.
+	// starts. Railway's live streams skip some records (they show up in a
+	// fresh subscription, not in the live push), so the source resubscribes
+	// every Resync, re-reading the last Overlap, and drops repeats by identity.
 	Overlap time.Duration `yaml:"overlap"`
+	Resync  time.Duration `yaml:"resync"`
 }
 
 func (c *Config) Defaults() {
@@ -59,7 +60,10 @@ func (c *Config) Defaults() {
 		c.Refresh = 15 * time.Second
 	}
 	if c.Overlap == 0 {
-		c.Overlap = 2 * time.Minute
+		c.Overlap = time.Minute
+	}
+	if c.Resync == 0 {
+		c.Resync = 30 * time.Second
 	}
 	if c.Tenant == "" {
 		c.Tenant = model.DefaultTenant
@@ -248,31 +252,35 @@ func (s *Source) names(serviceID string) (string, string) {
 	return name, s.envName
 }
 
-// seen remembers record identities for a while, so overlapping
-// subscriptions don't deliver a record twice. Owned by one stream goroutine.
+// seen remembers the identities of records delivered, so overlapping
+// subscriptions don't deliver a record twice. It is keyed to the records'
+// own timestamps, not to when they were seen: a resubscription returns
+// records newer than (newest - overlap), so every key in that range must be
+// kept, however long the stream has been idle. Owned by one goroutine.
 type seen struct {
-	ttl   time.Duration
-	m     map[string]time.Time
-	prune time.Time
+	overlap time.Duration
+	m       map[string]time.Time // key -> record timestamp
 }
 
-func newSeen(ttl time.Duration) *seen { return &seen{ttl: ttl, m: map[string]time.Time{}} }
+func newSeen(overlap time.Duration) *seen { return &seen{overlap: overlap, m: map[string]time.Time{}} }
 
-// first reports whether key is new, and remembers it.
-func (s *seen) first(key string, now time.Time) bool {
-	if now.Sub(s.prune) > s.ttl/4 {
-		for k, t := range s.m {
-			if now.Sub(t) > s.ttl {
-				delete(s.m, k)
-			}
-		}
-		s.prune = now
-	}
+// first reports whether key is new, and remembers it with the record's time.
+func (s *seen) first(key string, ts time.Time) bool {
 	if _, ok := s.m[key]; ok {
 		return false
 	}
-	s.m[key] = now
+	s.m[key] = ts
 	return true
+}
+
+// forget drops keys too old for any resubscription to return again.
+func (s *seen) forget(newest time.Time) {
+	floor := newest.Add(-s.overlap - time.Minute)
+	for k, t := range s.m {
+		if t.Before(floor) {
+			delete(s.m, k)
+		}
+	}
 }
 
 // ---- run ---------------------------------------------------------------------
@@ -355,7 +363,7 @@ func (s *Source) httpStream(ctx context.Context, d deployment) {
 	// than it. Each (re)subscription starts Overlap before the newest log seen,
 	// because logs do not arrive in timestamp order; request IDs drop repeats.
 	newest := time.Now()
-	dup := newSeen(2*s.cfg.Overlap + time.Minute)
+	dup := newSeen(s.cfg.Overlap)
 	vars := func() map[string]any {
 		return map[string]any{"deploymentId": d.ID, "filter": "", "beforeLimit": 5000,
 			"beforeDate": newest.Add(-s.cfg.Overlap).UTC().Format(time.RFC3339Nano)}
@@ -373,7 +381,7 @@ func (s *Source) httpStream(ctx context.Context, d deployment) {
 			if key == "" {
 				key = l.Timestamp.String() + l.Method + l.Path
 			}
-			if !dup.first(key, now) {
+			if !dup.first(key, l.Timestamp) {
 				s.Stats.Repeats.Add(1)
 				continue
 			}
@@ -391,6 +399,7 @@ func (s *Source) httpStream(ctx context.Context, d deployment) {
 				newest = l.Timestamp
 			}
 		}
+		dup.forget(newest)
 		if len(recs) > 0 {
 			s.Stats.HTTPRecords.Add(uint64(len(recs)))
 			s.submit(s.cfg.Tenant, recs)
@@ -436,7 +445,7 @@ func (s *Source) deployLogs(ctx context.Context) {
 		}
 	}()
 	newest := time.Now()
-	dup := newSeen(2*s.cfg.Overlap + time.Minute)
+	dup := newSeen(s.cfg.Overlap)
 	vars := func() map[string]any {
 		return map[string]any{"environmentId": s.cfg.EnvironmentID, "filter": "", "beforeLimit": 5000,
 			"beforeDate": newest.Add(-s.cfg.Overlap).UTC().Format(time.RFC3339Nano)}
@@ -455,7 +464,7 @@ func (s *Source) deployLogs(ctx context.Context) {
 			}
 			// Deploy logs carry no ID; their timestamp has nanosecond
 			// precision, so with the deployment and text it identifies a line.
-			if !dup.first(l.Tags.DeploymentID+"|"+l.Timestamp.Format(time.RFC3339Nano)+"|"+l.Message, now) {
+			if !dup.first(l.Tags.DeploymentID+"|"+l.Timestamp.Format(time.RFC3339Nano)+"|"+l.Message, l.Timestamp) {
 				s.Stats.Repeats.Add(1)
 				continue
 			}
@@ -480,6 +489,7 @@ func (s *Source) deployLogs(ctx context.Context) {
 				newest = l.Timestamp
 			}
 		}
+		dup.forget(newest)
 		if len(recs) > 0 {
 			s.Stats.DeployRecords.Add(uint64(len(recs)))
 			s.submit(s.cfg.Tenant, recs)
@@ -572,24 +582,71 @@ func (s *Source) session(ctx context.Context, query string, vars func() map[stri
 			break
 		}
 	}
+	// Reads run in their own goroutine: the websocket library closes the
+	// connection when a read's context expires, so a timer can't be a read
+	// timeout. A quiet stream is normal; Railway's pings keep it alive.
+	msgs := make(chan wsMsg, 64)
+	readErr := make(chan error, 1)
+	rctx, stopReads := context.WithCancel(ctx)
+	defer stopReads()
+	go func() {
+		for {
+			_, b, err := conn.Read(rctx)
+			if err != nil {
+				readErr <- err
+				return
+			}
+			var m wsMsg
+			if json.Unmarshal(b, &m) == nil {
+				select {
+				case msgs <- m:
+				case <-rctx.Done():
+					return
+				}
+			}
+		}
+	}()
+
 	delivered := false
 	seq := 0
-	for {
+	subscribe := func() (string, error) {
 		seq++
 		id := strconv.Itoa(seq)
 		payload, _ := json.Marshal(map[string]any{"query": query, "variables": vars()})
-		if err := write(wsMsg{ID: id, Type: "subscribe", Payload: payload}); err != nil {
+		return id, write(wsMsg{ID: id, Type: "subscribe", Payload: payload})
+	}
+	id, err := subscribe()
+	if err != nil {
+		return delivered, err
+	}
+	// Railway's live push skips some records that a fresh subscription
+	// returns, so the subscription is replaced every Resync, re-reading the
+	// last Overlap; repeats are dropped by identity downstream.
+	resync := time.NewTicker(s.cfg.Resync)
+	defer resync.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return delivered, ctx.Err()
+		case err := <-readErr:
 			return delivered, err
-		}
-		for {
-			// A healthy stream is quiet when nothing happens, so the read
-			// timeout is long; Railway's pings keep it alive.
-			m, err := read(5 * time.Minute)
-			if err != nil {
+		case <-resync.C:
+			if err := write(wsMsg{ID: id, Type: "complete"}); err != nil {
 				return delivered, err
 			}
+			if id, err = subscribe(); err != nil {
+				return delivered, err
+			}
+		case m := <-msgs:
 			switch m.Type {
+			case "ping":
+				if err := write(wsMsg{Type: "pong"}); err != nil {
+					return delivered, err
+				}
 			case "next":
+				if m.ID != id {
+					continue // late data from a subscription already replaced
+				}
 				var p struct {
 					Data map[string]json.RawMessage `json:"data"`
 				}
@@ -599,20 +656,18 @@ func (s *Source) session(ctx context.Context, query string, vars func() map[stri
 						handle(raw)
 					}
 				}
-			case "ping":
-				if err := write(wsMsg{Type: "pong"}); err != nil {
-					return delivered, err
-				}
 			case "error":
-				return delivered, fmt.Errorf("subscription error: %s", string(m.Payload))
+				if m.ID == id {
+					return delivered, fmt.Errorf("subscription error: %s", string(m.Payload))
+				}
 			case "complete":
-				// The server ends streams from time to time; start a new one
-				// from the newest log seen.
-			default:
-				continue
-			}
-			if m.Type == "complete" {
-				break
+				// The server ends streams from time to time; start a new
+				// one, from the newest record seen minus the overlap.
+				if m.ID == id {
+					if id, err = subscribe(); err != nil {
+						return delivered, err
+					}
+				}
 			}
 		}
 	}

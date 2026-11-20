@@ -183,3 +183,143 @@ func TestUnquoteStructuredAttributes(t *testing.T) {
 		t.Fatal("unquote")
 	}
 }
+
+// Railway's live push can skip a record that a fresh subscription returns.
+// The source must replace its subscription on a timer, recover the skipped
+// record, and drop the ones it already delivered.
+func TestResyncRecoversRecordsTheLivePushSkipped(t *testing.T) {
+	t0 := time.Now().Add(time.Second)
+	ts := func(s int) string { return t0.Add(time.Duration(s) * time.Second).UTC().Format(time.RFC3339Nano) }
+	logOf := func(id string, s int) map[string]any {
+		return map[string]any{"requestId": id, "timestamp": ts(s), "method": "GET", "path": "/", "httpStatus": 200, "totalDuration": 5}
+	}
+	var mu sync.Mutex
+	var subs []map[string]any
+	completes := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql/v2", func(w http.ResponseWriter, r *http.Request) {
+		var req struct{ Query string }
+		json.NewDecoder(r.Body).Decode(&req)
+		if strings.Contains(req.Query, "environment(") {
+			io.WriteString(w, `{"data":{"environment":{"name":"production","projectId":"p1","deployments":{"edges":[
+				{"node":{"id":"d1","serviceId":"s1","status":"SUCCESS","createdAt":"2026-11-21T00:00:00Z"}}]}}}}`)
+			return
+		}
+		io.WriteString(w, `{"data":{"project":{"services":{"edges":[{"node":{"id":"s1","name":"web"}}]}}}}`)
+	})
+	mux.HandleFunc("/graphql/internal", func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{"graphql-transport-ws"}})
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		ctx := r.Context()
+		send := func(v any) { b, _ := json.Marshal(v); c.Write(ctx, websocket.MessageText, b) }
+		for {
+			_, b, err := c.Read(ctx)
+			if err != nil {
+				return
+			}
+			var m struct {
+				ID, Type string
+				Payload  struct {
+					Query     string
+					Variables map[string]any
+				}
+			}
+			json.Unmarshal(b, &m)
+			switch m.Type {
+			case "connection_init":
+				send(map[string]string{"type": "connection_ack"})
+			case "complete":
+				mu.Lock()
+				completes++
+				mu.Unlock()
+			case "subscribe":
+				if !strings.Contains(m.Payload.Query, "httpLogs") {
+					continue
+				}
+				mu.Lock()
+				subs = append(subs, m.Payload.Variables)
+				n := len(subs)
+				mu.Unlock()
+				next := func(logs ...any) {
+					send(map[string]any{"id": m.ID, "type": "next", "payload": map[string]any{"data": map[string]any{"httpLogs": logs}}})
+				}
+				if n == 1 {
+					next(logOf("a", 1), logOf("c", 3)) // the live push skips "b"; the stream stays open
+				} else {
+					next(logOf("a", 1), logOf("b", 2), logOf("c", 3)) // a fresh subscription has it
+				}
+			}
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	var gmu sync.Mutex
+	var got []string
+	src := New(Config{ProjectToken: "tok", EnvironmentID: "e1", DeployLogs: new(bool),
+		APIURL: srv.URL + "/graphql/v2", StreamURL: "ws" + strings.TrimPrefix(srv.URL, "http") + "/graphql/internal",
+		Refresh: time.Hour, Overlap: 10 * time.Second, Resync: 300 * time.Millisecond},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func(_ string, recs []model.Record) {
+			gmu.Lock()
+			for _, r := range recs {
+				got = append(got, r.HTTP.RequestID)
+			}
+			gmu.Unlock()
+		})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { src.Run(ctx); close(done) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		gmu.Lock()
+		n := len(got)
+		gmu.Unlock()
+		if n >= 3 {
+			time.Sleep(700 * time.Millisecond) // two more resyncs: repeats must stay dropped
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	gmu.Lock()
+	defer gmu.Unlock()
+	if strings.Join(got, ",") != "a,c,b" {
+		t.Fatalf("delivered %v, want a,c,b: the skipped b recovered by a resync, nothing twice", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if completes < 1 || len(subs) < 2 {
+		t.Fatalf("completes %d, subscriptions %d: want the old subscription ended and a new one started", completes, len(subs))
+	}
+	if want := t0.Add(3*time.Second - 10*time.Second).UTC().Format(time.RFC3339Nano); subs[1]["beforeDate"] != want {
+		t.Fatalf("resync from %v, want newest minus overlap %s", subs[1]["beforeDate"], want)
+	}
+}
+
+// Dedupe memory follows the records' timestamps, not wall time: a record a
+// resubscription can return again is remembered however long the stream was
+// idle, and only records older than any resubscription reaches are forgotten.
+func TestSeenKeepsWhatAResubscriptionCanReturn(t *testing.T) {
+	base := time.Date(2026, 11, 21, 2, 23, 0, 0, time.UTC)
+	s := newSeen(time.Minute)
+	if !s.first("a", base) || s.first("a", base) {
+		t.Fatal("first sighting must be new, the second a repeat")
+	}
+	// Idle for an hour of wall time: nothing newer arrived, so "a" is still
+	// within reach of a resubscription and must stay remembered.
+	s.forget(base)
+	if s.first("a", base) {
+		t.Fatal("forgot a record a resubscription can still return")
+	}
+	// Once newer records move the floor past it, it can go.
+	s.forget(base.Add(3 * time.Minute))
+	if _, ok := s.m["a"]; ok {
+		t.Fatal("kept a record no resubscription can return")
+	}
+}

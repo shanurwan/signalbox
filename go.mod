@@ -3,6 +3,7 @@ module github.com/shanurwan/signalbox
 go 1.26.0
 
 require (
+	github.com/coder/websocket v1.8.14
 	github.com/prometheus/client_golang v1.25.0
 	go.opentelemetry.io/proto/otlp v1.11.1
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260928230214-8a89bd6388cc

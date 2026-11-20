@@ -39,6 +39,7 @@ import (
 	"github.com/shanurwan/signalbox/internal/model"
 	"github.com/shanurwan/signalbox/internal/notify"
 	"github.com/shanurwan/signalbox/internal/sink"
+	"github.com/shanurwan/signalbox/internal/source/railway"
 	"github.com/shanurwan/signalbox/internal/tail"
 )
 
@@ -53,10 +54,13 @@ type Server struct {
 	Store   *sink.ClickHouse
 	Hub     *tail.Hub
 	Pipe    *Pipeline
+	Railway *railway.Source // nil unless sources.railway is set
 	reg     *prometheus.Registry
 	tenants *registry
 	started time.Time
 	dirty   chan struct{} // a transition or delivery happened: save soon
+
+	railwayLag prometheus.Histogram
 }
 
 func New(cfg *config.Config, log *slog.Logger) *Server {
@@ -83,6 +87,15 @@ func New(cfg *config.Config, log *slog.Logger) *Server {
 	s.Pipe = &Pipeline{engine: s.Engine, hub: s.Hub, store: s.Store, red: newRED(s.reg)}
 	if cfg.DedupeWindow > 0 {
 		s.Pipe.dedupe = newDedupe(cfg.DedupeWindow, cfg.DedupeMaxEntries)
+	}
+	if rc := cfg.Sources.Railway; rc != nil {
+		s.Railway = railway.New(*rc, log, s.Pipe.Submit)
+		s.railwayLag = prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "signalbox_source_lag_seconds",
+			Help:    "Time from a record's own timestamp to its arrival in signalbox, for pulled sources.",
+			Buckets: []float64{.25, .5, 1, 2, 3, 5, 7.5, 10, 15, 20, 30, 60, 120},
+		})
+		s.reg.MustRegister(s.railwayLag)
 	}
 	s.reg.MustRegister(&selfCollector{s: s})
 	return s
@@ -183,6 +196,24 @@ func (s *Server) Run(ctx context.Context) error {
 		go func() { s.Store.Run(bg); done <- struct{}{} }()
 	} else {
 		done <- struct{}{}
+	}
+
+	if s.Railway != nil {
+		go s.Railway.Run(bg)
+		go func() {
+			t := time.NewTicker(5 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-bg.Done():
+					return
+				case <-t.C:
+					for _, ms := range s.Railway.Stats.TakeLag() {
+						s.railwayLag.Observe(ms / 1000)
+					}
+				}
+			}
+		}()
 	}
 
 	httpSrv := &http.Server{Addr: s.cfg.Listen, Handler: s.Handler(), ReadHeaderTimeout: 10 * time.Second}
@@ -555,23 +586,27 @@ func (g *grpcLogs) Export(ctx context.Context, req *collogs.ExportLogsServiceReq
 type selfCollector struct{ s *Server }
 
 var (
-	dRecords = prometheus.NewDesc("signalbox_ingested_records_total", "Records accepted into the pipeline.", nil, nil)
-	dDup     = prometheus.NewDesc("signalbox_duplicate_records_total", "Request logs dropped as duplicates by request ID.", nil, nil)
-	dLate    = prometheus.NewDesc("signalbox_late_records_total", "Matched records too old for their rule's window.", nil, nil)
-	dSeries  = prometheus.NewDesc("signalbox_alert_series", "Alert series held in memory, by state.", []string{"state"}, nil)
-	dNotify  = prometheus.NewDesc("signalbox_notifications_total", "Notification attempts, by receiver and result.", []string{"receiver", "result"}, nil)
-	dOutbox  = prometheus.NewDesc("signalbox_outbox_pending", "Notifications waiting to be delivered.", nil, nil)
-	dTail    = prometheus.NewDesc("signalbox_tail_subscribers", "Open live-tail connections.", nil, nil)
-	dStored  = prometheus.NewDesc("signalbox_storage_rows_total", "Rows sent to storage, by result.", []string{"result"}, nil)
-	dQueue   = prometheus.NewDesc("signalbox_storage_queue_rows", "Rows waiting to be written to storage.", nil, nil)
-	dFlush   = prometheus.NewDesc("signalbox_storage_last_flush_seconds", "Duration of the last successful storage write.", nil, nil)
-	dTenants = prometheus.NewDesc("signalbox_tenants", "Tenants, the default one included.", nil, nil)
-	dReject  = prometheus.NewDesc("signalbox_tenant_rejected_records_total", "Records refused by a tenant's rate limit (tenants with any).", []string{"tenant"}, nil)
-	dLimited = prometheus.NewDesc("signalbox_tenant_series_limited_total", "Records not evaluated because the tenant's series limit was reached (tenants with any).", []string{"tenant"}, nil)
+	dRecords  = prometheus.NewDesc("signalbox_ingested_records_total", "Records accepted into the pipeline.", nil, nil)
+	dDup      = prometheus.NewDesc("signalbox_duplicate_records_total", "Request logs dropped as duplicates by request ID.", nil, nil)
+	dLate     = prometheus.NewDesc("signalbox_late_records_total", "Matched records too old for their rule's window.", nil, nil)
+	dSeries   = prometheus.NewDesc("signalbox_alert_series", "Alert series held in memory, by state.", []string{"state"}, nil)
+	dNotify   = prometheus.NewDesc("signalbox_notifications_total", "Notification attempts, by receiver and result.", []string{"receiver", "result"}, nil)
+	dOutbox   = prometheus.NewDesc("signalbox_outbox_pending", "Notifications waiting to be delivered.", nil, nil)
+	dTail     = prometheus.NewDesc("signalbox_tail_subscribers", "Open live-tail connections.", nil, nil)
+	dStored   = prometheus.NewDesc("signalbox_storage_rows_total", "Rows sent to storage, by result.", []string{"result"}, nil)
+	dQueue    = prometheus.NewDesc("signalbox_storage_queue_rows", "Rows waiting to be written to storage.", nil, nil)
+	dFlush    = prometheus.NewDesc("signalbox_storage_last_flush_seconds", "Duration of the last successful storage write.", nil, nil)
+	dTenants  = prometheus.NewDesc("signalbox_tenants", "Tenants, the default one included.", nil, nil)
+	dReject   = prometheus.NewDesc("signalbox_tenant_rejected_records_total", "Records refused by a tenant's rate limit (tenants with any).", []string{"tenant"}, nil)
+	dSource   = prometheus.NewDesc("signalbox_source_records_total", "Records pulled from a source, by stream.", []string{"source", "stream"}, nil)
+	dSrcRecon = prometheus.NewDesc("signalbox_source_reconnects_total", "Stream reconnects to a pulled source.", []string{"source"}, nil)
+	dSrcErr   = prometheus.NewDesc("signalbox_source_errors_total", "Errors reading a pulled source.", []string{"source"}, nil)
+	dSrcLive  = prometheus.NewDesc("signalbox_source_streams", "Open streams to a pulled source.", []string{"source"}, nil)
+	dLimited  = prometheus.NewDesc("signalbox_tenant_series_limited_total", "Records not evaluated because the tenant's series limit was reached (tenants with any).", []string{"tenant"}, nil)
 )
 
 func (c *selfCollector) Describe(ch chan<- *prometheus.Desc) {
-	for _, d := range []*prometheus.Desc{dRecords, dDup, dLate, dSeries, dNotify, dOutbox, dTail, dStored, dQueue, dFlush, dTenants, dReject, dLimited} {
+	for _, d := range []*prometheus.Desc{dRecords, dDup, dLate, dSeries, dNotify, dOutbox, dTail, dStored, dQueue, dFlush, dTenants, dReject, dLimited, dSource, dSrcRecon, dSrcErr, dSrcLive} {
 		ch <- d
 	}
 }
@@ -600,6 +635,13 @@ func (c *selfCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(dNotify, prometheus.CounterValue, float64(st.Sent), name, "sent")
 		ch <- prometheus.MustNewConstMetric(dNotify, prometheus.CounterValue, float64(st.Failed), name, "retry")
 		ch <- prometheus.MustNewConstMetric(dNotify, prometheus.CounterValue, float64(st.Dropped), name, "dropped")
+	}
+	if r := s.Railway; r != nil {
+		ch <- prometheus.MustNewConstMetric(dSource, prometheus.CounterValue, float64(r.Stats.HTTPRecords.Load()), "railway", "http")
+		ch <- prometheus.MustNewConstMetric(dSource, prometheus.CounterValue, float64(r.Stats.DeployRecords.Load()), "railway", "deploy")
+		ch <- prometheus.MustNewConstMetric(dSrcRecon, prometheus.CounterValue, float64(r.Stats.Reconnects.Load()), "railway")
+		ch <- prometheus.MustNewConstMetric(dSrcErr, prometheus.CounterValue, float64(r.Stats.Errors.Load()), "railway")
+		ch <- prometheus.MustNewConstMetric(dSrcLive, prometheus.GaugeValue, float64(r.Stats.Streams.Load()), "railway")
 	}
 	all := s.tenants.all()
 	ch <- prometheus.MustNewConstMetric(dTenants, prometheus.GaugeValue, float64(len(all)))

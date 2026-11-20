@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/shanurwan/signalbox/internal/source/railway"
 )
 
 type Config struct {
@@ -34,6 +36,7 @@ type Config struct {
 	TenantReceiversAllowPrivate bool        `yaml:"tenant_receivers_allow_private"`
 	Mapping                     Mapping     `yaml:"mapping"`
 	ClickHouse                  *ClickHouse `yaml:"clickhouse"`
+	Sources                     Sources     `yaml:"sources"`
 	Receivers                   []Receiver  `yaml:"receivers"`
 	Rules                       []Rule      `yaml:"rules"`
 
@@ -53,6 +56,11 @@ type Mapping struct {
 	HTTPDurationMs []string `yaml:"http_duration_ms"`
 	HTTPDurationS  []string `yaml:"http_duration_s"`
 	RequestID      []string `yaml:"request_id"`
+}
+
+// Sources are inputs signalbox pulls from, besides what is pushed to it.
+type Sources struct {
+	Railway *railway.Config `yaml:"railway"`
 }
 
 // TenantLimits keep one tenant from using up what others share. Zero means
@@ -292,6 +300,12 @@ func (c *Config) validate() error {
 		active = append(active, r)
 	}
 	c.Receivers = active
+	if r := c.Sources.Railway; r != nil {
+		r.Defaults()
+		if err := r.Validate(); err != nil {
+			return err
+		}
+	}
 	names := map[string]bool{}
 	for i := range c.Rules {
 		r := &c.Rules[i]

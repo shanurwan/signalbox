@@ -1,0 +1,38 @@
+name: Something isn't working
+description: An alert that didn't fire, fired wrongly, or signalbox failing to start.
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+      placeholder: "The http-5xx alert stayed inactive while about 20% of requests returned 502."
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: How logs reach signalbox
+      options:
+        - Railway source (the deploy/railway config or template)
+        - OTLP over HTTP or gRPC
+        - JSON over HTTP
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: The rule or config involved
+      description: Remove tokens and webhook URLs first.
+      render: yaml
+  - type: textarea
+    id: logs
+    attributes:
+      label: signalbox's startup lines and any warnings
+      description: The lines from "starting signalbox" onwards, plus any WARN or ERROR lines.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: "the image tag, or the commit you deployed"

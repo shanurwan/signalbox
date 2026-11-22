@@ -1,0 +1,73 @@
+# signalbox for a Railway project: reads the HTTP and deploy logs of every
+# service in its environment and alerts on them. Used by the one-click
+# template; select it with SIGNALBOX_CONFIG=/etc/signalbox/railway.yaml.
+#
+# Needs RAILWAY_PROJECT_TOKEN (Project Settings > Tokens). Railway sets
+# RAILWAY_ENVIRONMENT_ID itself. Set at least one receiver variable below;
+# a receiver whose variable is empty is switched off.
+listen: ":8080"
+grpc_listen: ":4317"
+ingest_token: ${SIGNALBOX_INGEST_TOKEN}   # optional OTLP/JSON senders
+api_token: ${SIGNALBOX_API_TOKEN}         # protects /tail, /api/* and /metrics
+state_file: /data/signalbox-state.json    # on the template's volume
+
+sources:
+  railway:
+    project_token: ${RAILWAY_PROJECT_TOKEN}
+    environment_id: ${RAILWAY_ENVIRONMENT_ID}
+
+receivers:
+  - name: slack
+    type: slack
+    url: ${SLACK_WEBHOOK_URL}
+  - name: discord
+    type: discord
+    url: ${DISCORD_WEBHOOK_URL}
+  - name: pagerduty
+    type: pagerduty
+    routing_key: ${PAGERDUTY_ROUTING_KEY}
+  - name: webhook
+    type: webhook
+    url: ${ALERT_WEBHOOK_URL}
+
+rules:
+  # Requests failing: more than 5% 5xx over 5 minutes, sustained for 1.
+  - name: http-5xx
+    when: error_ratio > 0.05
+    min_requests: 20
+    window: 5m
+    for: 1m
+    severity: critical
+    summary: More than 5% of requests are failing with 5xx.
+    notify: [slack, discord, pagerduty, webhook]
+
+  # Requests slow: p99 above 2 s over 5 minutes, sustained for 5.
+  - name: http-slow
+    when: p99_ms > 2000
+    min_requests: 20
+    window: 5m
+    for: 5m
+    severity: warning
+    summary: The slowest 1% of requests take more than 2 seconds.
+    notify: [slack, discord, webhook]
+
+  # Error logs: a burst of error-level lines.
+  - name: error-logs
+    match: {min_severity: error}
+    when: count > 25
+    window: 5m
+    for: 1m
+    severity: warning
+    summary: A burst of error-level log lines.
+    notify: [slack, discord, webhook]
+
+  # Crash signatures: one is enough.
+  - name: crash
+    match:
+      body: '(?i)(panic:|panic serving|fatal error|out of memory|segmentation fault|unhandled (promise )?rejection|traceback \(most recent call last\))'
+    when: count > 0
+    window: 5m
+    resolve_after: 10m
+    severity: critical
+    summary: A service logged a crash.
+    notify: [slack, discord, pagerduty, webhook]

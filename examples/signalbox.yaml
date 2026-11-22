@@ -67,7 +67,7 @@ rules:
   # Crash signatures: one is enough.
   - name: crash
     match:
-      body: '(?i)(panic:|fatal error|out of memory|segmentation fault|unhandled (promise )?rejection|traceback \(most recent call last\))'
+      body: '(?i)(panic:|panic serving|fatal error|out of memory|segmentation fault|unhandled (promise )?rejection|traceback \(most recent call last\))'
     when: count > 0
     window: 5m
     resolve_after: 10m

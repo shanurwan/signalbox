@@ -159,9 +159,11 @@ type Rule struct {
 	Quantile  float64 `yaml:"-"`
 }
 
-var envRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+// ${VAR} or ${VAR:-default}; the default is used when VAR is unset or empty,
+// as in a POSIX shell.
+var envRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}`)
 
-// Load reads a YAML file, expands ${VAR} references from the environment,
+// Load reads a YAML file, expands ${VAR} and ${VAR:-default} references from the environment,
 // fills defaults and validates.
 //
 // SIGNALBOX_CONFIG_YAML, when set, is used instead of the file, for
@@ -177,11 +179,18 @@ func Load(path string) (*Config, error) {
 	return Parse(raw)
 }
 
+func expandRef(m string) string {
+	sub := envRef.FindStringSubmatch(m)
+	if v := os.Getenv(sub[1]); v != "" {
+		return v
+	}
+	return sub[2]
+}
+
 func Parse(raw []byte) (*Config, error) {
-	// Unset variables expand to "", which validation reports where it matters.
-	expanded := envRef.ReplaceAllStringFunc(string(raw), func(m string) string {
-		return os.Getenv(envRef.FindStringSubmatch(m)[1])
-	})
+	// Unset variables without a default expand to "", which validation reports
+	// where it matters.
+	expanded := envRef.ReplaceAllStringFunc(string(raw), expandRef)
 	var c Config
 	dec := yaml.NewDecoder(strings.NewReader(expanded))
 	dec.KnownFields(true)
@@ -399,6 +408,10 @@ func (r *Rule) check() error {
 	case "count", "rate":
 	case "error_ratio":
 		r.Match.HTTPOnly = true
+		// A percentage written as 5 instead of 0.05 would never fire.
+		if v < 0 || v > 1 {
+			return fmt.Errorf("rule %q: error_ratio is a fraction between 0 and 1 (0.05 means 5%%), got %v", r.Name, v)
+		}
 	case "p50_ms", "p90_ms", "p95_ms", "p99_ms":
 		r.Match.HTTPOnly = true
 		q, _ := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(r.Metric, "p"), "_ms"))

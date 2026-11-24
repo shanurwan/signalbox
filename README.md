@@ -93,7 +93,7 @@ Operators are `>`, `>=`, `<` and `<=`. A `<` rule (for example `count < 1`) dete
 
 `match` takes `service`, `environment`, `min_severity`, `body` (a regex, for log lines) and `path` (a regex, for request logs). `group_by` takes `service`, `environment`, `path`, `method` or `attr.<key>`.
 
-The whole config can also come from the `SIGNALBOX_CONFIG_YAML` environment variable. `${VAR}` references are expanded from the environment, and a receiver whose URL or key is empty is switched off with a warning instead of failing startup. A complete example is [examples/signalbox.yaml](examples/signalbox.yaml).
+The whole config can also come from the `SIGNALBOX_CONFIG_YAML` environment variable. `${VAR}` references are expanded from the environment (`${VAR:-default}` falls back to `default` when `VAR` is unset or empty), and a receiver whose URL or key is empty is switched off with a warning instead of failing startup. A complete example is [examples/signalbox.yaml](examples/signalbox.yaml).
 
 ## Tenants
 

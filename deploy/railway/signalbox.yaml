@@ -5,6 +5,13 @@
 # Needs RAILWAY_PROJECT_TOKEN (Project Settings > Tokens). Railway sets
 # RAILWAY_ENVIRONMENT_ID itself. Set at least one receiver variable below;
 # a receiver whose variable is empty is switched off.
+#
+# Thresholds can be changed with variables, no fork needed (defaults shown):
+#   SIGNALBOX_WINDOW=5m            window every rule looks back over
+#   SIGNALBOX_5XX_RATIO=0.05       share of requests failing with 5xx (0.05 = 5%)
+#   SIGNALBOX_MIN_REQUESTS=20      requests needed in the window before the HTTP rules judge
+#   SIGNALBOX_P99_MS=2000          p99 latency, in milliseconds
+#   SIGNALBOX_ERROR_LINES=25       error-level log lines in the window
 listen: ":8080"
 grpc_listen: ":4317"
 ingest_token: ${SIGNALBOX_INGEST_TOKEN}   # optional OTLP/JSON senders
@@ -31,31 +38,31 @@ receivers:
     url: ${ALERT_WEBHOOK_URL}
 
 rules:
-  # Requests failing: more than 5% 5xx over 5 minutes, sustained for 1.
+  # Requests failing: 5xx share above SIGNALBOX_5XX_RATIO, sustained for 1 minute.
   - name: http-5xx
-    when: error_ratio > 0.05
-    min_requests: 20
-    window: 5m
+    when: error_ratio > ${SIGNALBOX_5XX_RATIO:-0.05}
+    min_requests: ${SIGNALBOX_MIN_REQUESTS:-20}
+    window: ${SIGNALBOX_WINDOW:-5m}
     for: 1m
     severity: critical
-    summary: More than 5% of requests are failing with 5xx.
+    summary: Too many requests are failing with 5xx.
     notify: [slack, discord, pagerduty, webhook]
 
-  # Requests slow: p99 above 2 s over 5 minutes, sustained for 5.
+  # Requests slow: p99 above SIGNALBOX_P99_MS, sustained for 5 minutes.
   - name: http-slow
-    when: p99_ms > 2000
-    min_requests: 20
-    window: 5m
+    when: p99_ms > ${SIGNALBOX_P99_MS:-2000}
+    min_requests: ${SIGNALBOX_MIN_REQUESTS:-20}
+    window: ${SIGNALBOX_WINDOW:-5m}
     for: 5m
     severity: warning
-    summary: The slowest 1% of requests take more than 2 seconds.
+    summary: The slowest 1% of requests take more than ${SIGNALBOX_P99_MS:-2000} ms.
     notify: [slack, discord, webhook]
 
   # Error logs: a burst of error-level lines.
   - name: error-logs
     match: {min_severity: error}
-    when: count > 25
-    window: 5m
+    when: count > ${SIGNALBOX_ERROR_LINES:-25}
+    window: ${SIGNALBOX_WINDOW:-5m}
     for: 1m
     severity: warning
     summary: A burst of error-level log lines.
@@ -66,7 +73,7 @@ rules:
     match:
       body: '(?i)(panic:|panic serving|fatal error|out of memory|segmentation fault|unhandled (promise )?rejection|traceback \(most recent call last\))'
     when: count > 0
-    window: 5m
+    window: ${SIGNALBOX_WINDOW:-5m}
     resolve_after: 10m
     severity: critical
     summary: A service logged a crash.

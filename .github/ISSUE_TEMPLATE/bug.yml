@@ -1,5 +1,6 @@
 name: Something isn't working
 description: An alert that didn't fire, fired wrongly, or signalbox failing to start.
+labels: [bug]
 body:
   - type: textarea
     id: what

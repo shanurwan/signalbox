@@ -169,6 +169,10 @@ Ingest takes an ingest token, which picks the tenant. Everything else takes an A
 
 [docs/design.md](docs/design.md) is the engineering requirements document. It covers where signalbox fits beside a metrics pipeline for stateless and stateful workloads, the alert state machine, tenant isolation, why alerting comes before storage, delivery guarantees, restart warm-up, late and duplicate data, and how to scale past one node.
 
+## Contributing
+
+Bug reports and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers setup, tests and what a good pull request looks like. Report security problems privately, as described in [SECURITY.md](SECURITY.md).
+
 ## License
 
 Apache-2.0

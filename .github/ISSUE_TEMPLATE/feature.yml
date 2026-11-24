@@ -1,0 +1,32 @@
+name: Idea or feature request
+description: Something signalbox should do that it doesn't yet.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The problem first, not the solution. What happened, or what did you need to know, that signalbox didn't tell you?
+      placeholder: "I want to be told when a cron service stops logging for 30 minutes."
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help?
+      description: Your idea for how signalbox could do it, if you have one.
+  - type: dropdown
+    id: source
+    attributes:
+      label: How logs reach signalbox
+      options:
+        - Railway source (the deploy/railway config or template)
+        - OTLP over HTTP or gRPC
+        - JSON over HTTP
+        - Other
+  - type: checkboxes
+    id: pr
+    attributes:
+      label: Contributing
+      options:
+        - label: I'd like to send a pull request for this.

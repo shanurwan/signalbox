@@ -6,6 +6,20 @@ Send logs and request logs over OpenTelemetry (OTLP) or plain JSON. signalbox wa
 
 Most hosting dashboards alert on CPU, memory and disk. The failures your users actually feel usually show up first somewhere else: in a rising share of 502s, a p99 that has doubled, or a `panic:` line in the logs. signalbox is for those.
 
+## Why not write your own?
+
+You can, and for one regular expression sent to Discord you probably should. An alert that only checks "more than 5% errors" takes an afternoon. An alert you can trust takes longer, because what breaks it shows up in production, not in the docs:
+
+- A live log stream can lose records. In testing, one hosting platform's live HTTP log stream delivered 914 of 1,000 requests until it was fixed upstream. An alert reading it was working from incomplete data. signalbox's platform source also re-reads recent logs to recover records the live stream skipped.
+- Forwarders replay records after a reconnect. Counted twice, they cause false alerts. signalbox drops duplicates by request ID.
+- Records arrive late and out of order. signalbox windows them by when the request happened, not when the log arrived.
+- Go recovers a handler panic and logs `http: panic serving ...`, with no `panic:` in the line. A naive crash rule never fires on it.
+- A restart forgets open alerts, so they re-send or never resolve. signalbox keeps alert state on disk.
+- At night, 1 failure in 3 requests is "33% errors". Rules can require a minimum number of requests before they judge.
+- An error rate hovering at the threshold fires and resolves all night. Rules hold for a set time before firing and before resolving.
+
+signalbox has a test for each of these. If you'd rather build your own, use the list as a checklist.
+
 ## What it does
 
 - **Alerts on request logs:** error ratio, p50/p90/p95/p99 latency and request rate, per service or per path.

@@ -15,6 +15,17 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=1 ./...
       - run: go run ./cmd/signalbox -config examples/signalbox.yaml -check
+  # The job above tests the oldest Go that go.mod allows. The image is built
+  # with a newer Go (see Dockerfile), so test that too.
+  test-latest-go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
   image:
     runs-on: ubuntu-latest
     steps:
